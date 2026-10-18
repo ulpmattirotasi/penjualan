@@ -1,0 +1,3217 @@
+<html lang="id"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        const realDecodeURIComponent = decodeURIComponent;
+        const RealTextEncoder = TextEncoder;
+        const realAtob = atob;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
+        // page and would load that page in the frame instead of scrolling.
+        const sameDocumentFragment = (linkEl) => {
+          const written = linkEl.getAttribute("href")?.trim();
+          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
+          return written.slice(1);
+        };
+
+        const scrollToFragment = (fragment) => {
+          let decoded = fragment;
+          try {
+            decoded = realDecodeURIComponent(fragment);
+          } catch (error) {}
+          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
+          for (const named of target ? [] : document.getElementsByName(decoded)) {
+            if (named.localName === "a") {
+              target = named;
+              break;
+            }
+          }
+          if (target) {
+            target.scrollIntoView();
+          } else if (decoded.toLowerCase() === "top") {
+            window.scrollTo(0, 0);
+          } else {
+            return false;
+          }
+          return true;
+        };
+
+        // Same decoder as dataUrlFile in app/page.tsx; change both together.
+        const hexPair = /^[0-9a-f]{2}$/i;
+        const dataUrlFile = (href) => {
+          const hash = href.indexOf("#");
+          const url = hash === -1 ? href : href.slice(0, hash);
+          const comma = url.indexOf(",");
+          if (comma === -1) return null;
+          const header = url.slice(0, comma);
+          const payload = url.slice(comma + 1);
+          const mimeMatch = header.match(/data:([^;]+)/);
+          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+          const declaredBase64 = header
+            .split(";")
+            .slice(1)
+            .some((param) => param.trim().toLowerCase() === "base64");
+          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
+          const binaryType = type !== "" && !type.startsWith("text/");
+          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
+            let binary = null;
+            try {
+              binary = realAtob(
+                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+              );
+            } catch (error) {
+              if (declaredBase64) return null;
+            }
+            if (binary !== null) {
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              return { mimeType, data: bytes.buffer };
+            }
+          }
+          const input = new RealTextEncoder().encode(payload);
+          const bytes = new Uint8Array(input.length);
+          let length = 0;
+          for (let i = 0; i < input.length; i++) {
+            if (input[i] === 0x25 && i + 2 < input.length) {
+              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
+              if (hexPair.test(pair)) {
+                bytes[length++] = parseInt(pair, 16);
+                i += 2;
+                continue;
+              }
+            }
+            bytes[length++] = input[i];
+          }
+          return { mimeType, data: bytes.slice(0, length).buffer };
+        };
+
+        window.addEventListener('click', (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+
+          const fragment = sameDocumentFragment(linkEl);
+          if (fragment !== null) {
+            const handledByArtifact = event.defaultPrevented;
+            event.preventDefault();
+            if (handledByArtifact || fragment === "" || scrollToFragment(fragment)) return;
+            // A fragment that names nothing in the artifact may name something in the host,
+            // such as a project thread. The artifact's own listeners still see the click.
+            realParent.postMessage({ type: 'openExternal', href }, '*');
+            return;
+          }
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (href.startsWith("data:")) {
+            const file = dataUrlFile(href);
+            if (!file) return;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data: file.data,
+              mimeType: file.mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  <style id="claude-scrollbar">@layer claude-scrollbar{*{scrollbar-width:thin}html{scrollbar-color:rgb(128 128 128 / 50%) transparent}}</style><script>
+(function () {
+  "use strict";
+  if (window.__coworkHtmlReviewGuest) return;
+  window.__coworkHtmlReviewGuest = true;
+
+  var READY_TYPE = "__cowork_html_review_ready__";
+  var SEL_CLASS = "__cwhr-sel";
+  var CONTEXT_LEN = 32;
+  var EXACT_CAP = 1000;
+  var port = null;
+  var mode = false;
+  var pins = [];
+  var quotes = [];
+  // Resolved Range per quote id; invalidated on DOM mutation and on a
+  // fresh quotes set. Scroll/resize re-reports just re-read
+  // getClientRects() from the cached Range. Null prototype - ids are
+  // collaborator-writable and must not collide with Object.prototype.
+  var quoteRanges = Object.create(null);
+  var hoverEl = null;
+  var selected = null;
+  var hasTextSel = false;
+  var rafPending = false;
+  // Capture before page body scripts can shadow them; start() defers
+  // to DOMContentLoaded which page code can race.
+  var _MessageChannel = window.MessageChannel;
+  var _topPost = window.top.postMessage.bind(window.top);
+
+  function visibleText(el) {
+    // innerText drops display:none/visibility:hidden subtrees; keep an
+    // empty innerText (icon-only el) rather than falling through to
+    // textContent which would re-include hidden text.
+    var t = typeof el.innerText === "string" ? el.innerText : (el.textContent || "");
+    return t.replace(/\s+/g, " ").trim();
+  }
+
+  // Comment-mode cursor: see HTML_PREVIEW_COMMENT_CURSOR above.
+  var BUBBLE_CURSOR = "url(\"data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20width%3D'24'%20height%3D'24'%20viewBox%3D'0%200%2024%2024'%3E%3Cpath%20d%3D'M12%20.5h0A11.5%2011.5%200%200%201%2023.5%2012v0A11.5%2011.5%200%200%201%2012%2023.5H2.5a2%202%200%200%201-2-2V12A11.5%2011.5%200%200%201%2012%20.5Z'%20fill%3D'%23fff'%20stroke%3D'rgba(0%2C0%2C0%2C0.22)'%20stroke-width%3D'1'%2F%3E%3C%2Fsvg%3E\") 1 23, url(\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAACjklEQVR4AbRWS2gaURR9TGpiFTUEWpKQkA+EruqizWcRSBRT/G8KKpXiyo0ra1fVNiDFLmypFUo3iht/iO4Uay1FGwtFECl1p6KWLly4CGqrSMTY+wRFQ7WhGYd7Zu697845b+7M8B6BJh+UxcXFG3a7XeTxeHQAC+C12+1+ZLPZhHgMbp8FjLWxAkaj8U48Hg8lEomfIpEoLBaLLTKZTAd4LJFI3kD8HsZ+xGKxoMFgYI9T+JvAtUAg8FylUn3hcDj8ra0t6vLyMmKxWIhCofSAfZyDMRqXy+Wr1eqvPp/vKYjMAEZsRMDpdN6MRCKf+Xz+8cbGBm2kckIAtXShUGgKh8Mnfr9/Ybh0IKDT6a4vLS19EggE+wwGY7jmUj6TyUTQyv35+fmP0MbBexkISKVS+97e3u1LsU0oAo67Go3G1i/pCZjN5t3Nzc0H/zPzPlH/ip8EWvbQYrHs4hwWmN3e3n62traGfZy7MtbX12fYbPYTIKIQOzs7C6urq/cgINVWVlaO4EtjEXq9nken06mksgMZtJthtVp5xNzcHBsEIEWu0Wg0RKVS2USz2WTigFx6hPCkMTfRarXgB6WQzd/j63Q6bdK+nB7j0KnRaCCCIMpTE4D2oEql8m1qAvV6/VSr1U5PIJvN+qFjv6fyBIVC4ZfD4XgJAmekC9RqNZROp1+FQqESCCDSBWCVO1EoFC8wOQZpAnjm0Wj0O/xX94H4HNAzotvtNnreFU6lUgllMplAMpnclcvlp8NURC6Xi8BLGc5N9NvtNqpWq6hcLqN8Pn8OLUkAMe/g4EAOG4WzizcTJpPpA6zFIpfL9Ra2I45/IRgM2lKp1LtisXjs9XpvHR4eHimVythF4n78BwAA//8r8OPFAAAABklEQVQDAPCY8Oae0TJxAAAAAElFTkSuQmCC\") 1 23, default";
+
+  function injectStyle() {
+    var style = document.createElement("style");
+    // Hover box is painted by the host (from streamed rects); the guest
+    // marks the selected element and, in comment mode, swaps the native
+    // cursor for the comment bubble (forced, so page cursor styles don't
+    // fight the picker). While a composer or thread card is open the arrow
+    // returns, so the bubble cursor and the pin just placed never show at
+    // once. Keyed on <html> data attributes, which page scripts that
+    // rewrite body.className leave alone; ":not(#_)" lifts the rules to
+    // id-level specificity so a page's own !important cursor rules lose.
+    var ANY = ":not(#__cwhr_)";
+    var MODE = "html[data-cwhr-mode]";
+    var COMPOSING = MODE + "[data-cwhr-composing]";
+    style.textContent =
+      "." + SEL_CLASS + "{outline:1px solid hsl(40 70% 40%) !important;outline-offset:0;}" +
+      MODE + ANY + "," + MODE + " " + ANY + "{cursor:" + BUBBLE_CURSOR + " !important;}" +
+      COMPOSING + ANY + "," + COMPOSING + " " + ANY + "{cursor:default !important;}";
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function isUnique(sel) {
+    try {
+      return document.querySelectorAll(sel).length === 1;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Mirrors the host's stripInvisibles ranges. The host strips these
+  // from stored selectors, so a selector built on a value containing
+  // them would validate here but never match again - skip those rungs
+  // and fall through to the structural ladder instead.
+  function hasInvisibles(s) {
+    for (var i = 0; i < s.length; i++) {
+      var c = s.codePointAt(i);
+      if (c > 0xffff) i++;
+      if (
+        c <= 0x1f ||
+        c === 0x061c ||
+        c === 0x070f ||
+        c === 0xad ||
+        (c >= 0x7f && c <= 0x9f) ||
+        c === 0x115f ||
+        c === 0x1160 ||
+        c === 0x180e ||
+        (c >= 0x200b && c <= 0x200f) ||
+        (c >= 0x202a && c <= 0x202e) ||
+        (c >= 0x2060 && c <= 0x2064) ||
+        (c >= 0x2066 && c <= 0x2069) ||
+        c === 0x3164 ||
+        c === 0xfeff ||
+        (c >= 0xfff9 && c <= 0xfffb) ||
+        c === 0xffa0 ||
+        (c >= 0xe0000 && c <= 0xe007f)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function escapeAttr(v) {
+    return String(v).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  }
+
+  // Selector ladder: unique #id -> unique [data-*] -> structural
+  // tag:nth-of-type path rooted at the nearest unique-id ancestor.
+  function selectorFor(el) {
+    if (el.id && !hasInvisibles(el.id) && isUnique("#" + CSS.escape(el.id))) {
+      return "#" + CSS.escape(el.id);
+    }
+    for (var i = 0; i < el.attributes.length; i++) {
+      var attr = el.attributes[i];
+      if (
+        attr.name.indexOf("data-") === 0 &&
+        attr.value &&
+        !hasInvisibles(attr.value)
+      ) {
+        var dataSel = "[" + attr.name + '="' + escapeAttr(attr.value) + '"]';
+        if (isUnique(dataSel)) return dataSel;
+      }
+    }
+    var parts = [];
+    var cur = el;
+    while (cur && cur !== document.body && cur.nodeType === 1 && parts.length < 10) {
+      var sel = cur.tagName.toLowerCase();
+      var parent = cur.parentElement;
+      if (parent) {
+        var sameTag = [];
+        for (var c = 0; c < parent.children.length; c++) {
+          if (parent.children[c].tagName === cur.tagName) sameTag.push(parent.children[c]);
+        }
+        if (sameTag.length > 1) {
+          sel += ":nth-of-type(" + (sameTag.indexOf(cur) + 1) + ")";
+        }
+      }
+      parts.unshift(sel);
+      if (
+        parent &&
+        parent.id &&
+        !hasInvisibles(parent.id) &&
+        isUnique("#" + CSS.escape(parent.id))
+      ) {
+        parts.unshift("#" + CSS.escape(parent.id));
+        return parts.join(" > ");
+      }
+      cur = parent;
+    }
+    if (cur === document.body) {
+      parts.unshift("body");
+      return parts.join(" > ");
+    }
+    // Depth cap hit without a root - an unrooted chain would match the
+    // first structural pattern anywhere in the document. Mark the pin
+    // detached instead of attaching it to the wrong element.
+    return ":not(*)";
+  }
+
+  function descriptorFor(el) {
+    var tag = "<" + el.tagName.toLowerCase() + ">";
+    var idPart = el.id ? " #" + el.id : "";
+    var text = visibleText(el).slice(0, 60);
+    var textPart = text ? ' "' + text + '"' : "";
+    // Nearest id'd ancestor, skipping the UCR-injected
+    // #artifacts-component-root-* wrapper which is implementation noise.
+    var section = el.parentElement;
+    while (
+      section &&
+      (!section.id || section.id.indexOf("artifacts-component-root") === 0)
+    ) {
+      section = section.parentElement;
+    }
+    var sectionPart = section && section.id ? " in #" + section.id : "";
+    return (tag + idPart + textPart + sectionPart).slice(0, 400);
+  }
+
+  // textContent offset of (node, offset) within body - the coordinate
+  // system text-quote anchors are stored in. -1 when the boundary
+  // isn't under body (shadow root, detached).
+  function textOffset(node, offset) {
+    var body = document.body;
+    if (!body) return -1;
+    try {
+      var pre = document.createRange();
+      pre.selectNodeContents(body);
+      pre.setEnd(node, offset);
+      return pre.toString().length;
+    } catch (e) {
+      return -1;
+    }
+  }
+
+  // Inverse: build a Range covering [start, end) in body.textContent.
+  function rangeForOffsets(start, end) {
+    var body = document.body;
+    if (!body) return null;
+    var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+    var acc = 0;
+    var range = document.createRange();
+    var haveStart = false;
+    var t;
+    while ((t = walker.nextNode())) {
+      var next = acc + t.length;
+      if (!haveStart && start < next) {
+        range.setStart(t, start - acc);
+        haveStart = true;
+      }
+      if (haveStart && end <= next) {
+        range.setEnd(t, end - acc);
+        return range;
+      }
+      acc = next;
+    }
+    return null;
+  }
+
+  // Context-scored search (W3C text-quote resolution): slice-check the
+  // hint, else pick the occurrence whose surrounding chars best match
+  // prefix/suffix. MIRRORS locateTextQuote() above line-for-line - the
+  // tested export is the contract; this copy is what the sandbox runs.
+  function locateQuote(text, q) {
+    var ex = q.exact;
+    if (!ex) return null;
+    var hint = q.startOffset >= 0 ? q.startOffset : 0;
+    if (text.slice(hint, hint + ex.length) === ex) {
+      return { start: hint, end: hint + ex.length };
+    }
+    var best = -1;
+    var bestScore = -1;
+    var bestDist = Infinity;
+    var scanned = 0;
+    for (var idx = text.indexOf(ex); idx !== -1 && ++scanned <= 1000; idx = text.indexOf(ex, idx + 1)) {
+      var before = text.slice(Math.max(0, idx - CONTEXT_LEN), idx);
+      var after = text.slice(idx + ex.length, idx + ex.length + CONTEXT_LEN);
+      var sc = 0;
+      for (var i = 1; i <= q.prefix.length && i <= before.length; i++) {
+        if (q.prefix[q.prefix.length - i] !== before[before.length - i]) break;
+        sc++;
+      }
+      for (var j = 0; j < q.suffix.length && j < after.length; j++) {
+        if (q.suffix[j] !== after[j]) break;
+        sc++;
+      }
+      var dist = Math.abs(idx - hint);
+      if (sc > bestScore || (sc === bestScore && dist < bestDist)) {
+        best = idx;
+        bestScore = sc;
+        bestDist = dist;
+      }
+    }
+    return best === -1 ? null : { start: best, end: best + ex.length };
+  }
+
+  function collectLineRects(range, cap) {
+    var out = [];
+    var rects = range.getClientRects();
+    for (var i = 0; i < rects.length && out.length < cap; i++) {
+      var r = rects[i];
+      if (r.width > 0 && r.height > 0) {
+        out.push({ x: r.left, y: r.top, w: r.width, h: r.height });
+      }
+    }
+    return out;
+  }
+
+  function reportTextSel(full) {
+    if (!port) return;
+    var sel = window.getSelection();
+    var r = sel && !sel.isCollapsed && sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
+    if (!r || !document.body || !document.body.contains(r.commonAncestorContainer)) {
+      if (hasTextSel) {
+        hasTextSel = false;
+        port.postMessage({ type: "textClear" });
+      }
+      return;
+    }
+    hasTextSel = true;
+    var br = r.getBoundingClientRect();
+    var msg = {
+      type: "textCapture",
+      rect: { x: br.left, y: br.top, w: br.width, h: br.height },
+      lineRects: collectLineRects(r, 80),
+    };
+    if (full) {
+      var live = document.body.textContent || "";
+      var so = textOffset(r.startContainer, r.startOffset);
+      var eo = textOffset(r.endContainer, r.endOffset);
+      if (so < 0 || eo < 0 || eo <= so) {
+        // Unanchorable selection (shadow root, foreign node). A
+        // rect-only post here would make the host pair the new rect
+        // with a stale prior anchor - clear instead.
+        hasTextSel = false;
+        port.postMessage({ type: "textClear" });
+        return;
+      }
+      // Denomination invariant: exact/prefix/suffix are byte-identical
+      // slices of body.textContent. Truncation adjusts endOffset so
+      // the host's (endOffset - startOffset === exact.length) shape
+      // check holds. Cut points back off surrogate halves - a lone
+      // surrogate would never relocate and fails UTF-8 persist.
+      var capped = Math.min(eo, so + EXACT_CAP);
+      if (capped < eo) {
+        var hc = live.charCodeAt(capped - 1);
+        if (hc >= 0xd800 && hc <= 0xdbff) capped--;
+      }
+      if (capped <= so) {
+        port.postMessage(msg);
+        return;
+      }
+      var pStart = Math.max(0, so - CONTEXT_LEN);
+      var pc = live.charCodeAt(pStart);
+      if (pc >= 0xdc00 && pc <= 0xdfff) pStart++;
+      var sEnd = Math.min(live.length, capped + CONTEXT_LEN);
+      if (sEnd < live.length) {
+        var sc = live.charCodeAt(sEnd - 1);
+        if (sc >= 0xd800 && sc <= 0xdbff) sEnd--;
+      }
+      msg.exact = live.slice(so, capped);
+      msg.prefix = live.slice(pStart, so);
+      msg.suffix = live.slice(capped, sEnd);
+      msg.startOffset = so;
+      msg.endOffset = capped;
+    }
+    port.postMessage(msg);
+  }
+
+  function clearSelection() {
+    if (selected) {
+      selected.classList.remove(SEL_CLASS);
+      selected = null;
+    }
+  }
+
+  // rAF-throttled cursor + hover-rect stream so the host can paint the
+  // inspector hover box (and knows the pointer is present) in comment mode.
+  var cursorPending = false;
+  var cursorX = -1;
+  var cursorY = -1;
+  function flushCursor() {
+    cursorPending = false;
+    if (!port) return;
+    var hover = null;
+    if (
+      hoverEl &&
+      hoverEl.nodeType === 1 &&
+      hoverEl !== document.body &&
+      hoverEl !== document.documentElement
+    ) {
+      var r = hoverEl.getBoundingClientRect();
+      if (r.width > 0 || r.height > 0) {
+        hover = { x: r.left, y: r.top, w: r.width, h: r.height };
+      }
+    }
+    port.postMessage({ type: "cursor", x: cursorX, y: cursorY, hover: hover });
+  }
+  function scheduleCursor() {
+    if (!cursorPending) {
+      cursorPending = true;
+      requestAnimationFrame(flushCursor);
+    }
+  }
+  function onMouseMove(ev) {
+    if (!mode || !port) return;
+    // Over the scrollbar gutter (clientX/Y past the content box) - hide
+    // the hover box like a leave.
+    var de = document.documentElement;
+    if (ev.clientX >= de.clientWidth || ev.clientY >= de.clientHeight) {
+      cursorX = -1;
+      cursorY = -1;
+      hoverEl = null;
+      scheduleCursor();
+      return;
+    }
+    cursorX = ev.clientX;
+    cursorY = ev.clientY;
+    hoverEl = ev.target;
+    scheduleCursor();
+  }
+  function onMouseLeave() {
+    if (!mode || !port) return;
+    cursorX = -1;
+    cursorY = -1;
+    hoverEl = null;
+    scheduleCursor();
+  }
+
+  function onClick(ev) {
+    if (!port) return;
+    if (!mode) {
+      // Mode off: don't intercept the page, just let the host close any
+      // open popover (thread card click-away). A non-collapsed selection
+      // means the click ended a drag-select - not a click-away.
+      var s = window.getSelection();
+      if (!s || s.isCollapsed) port.postMessage({ type: "clickAway" });
+      return;
+    }
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    var el = ev.target;
+    if (!el || el.nodeType !== 1 || el === document.documentElement) return;
+    if (el === document.body && el.firstElementChild) {
+      // Pin on body is rarely intentional; keep it anyway but as body.
+    }
+    clearSelection();
+    selected = el;
+    el.classList.add(SEL_CLASS);
+    var rect = el.getBoundingClientRect();
+    var pinX = rect.width > 0 ? (ev.clientX - rect.left) / rect.width : 0.5;
+    var pinY = rect.height > 0 ? (ev.clientY - rect.top) / rect.height : 0.5;
+    port.postMessage({
+      type: "capture",
+      selector: selectorFor(el).slice(0, 1000),
+      textHint: visibleText(el).slice(0, 300),
+      descriptor: descriptorFor(el),
+      pinX: Math.min(1, Math.max(0, pinX)),
+      pinY: Math.min(1, Math.max(0, pinY)),
+      clientX: ev.clientX,
+      clientY: ev.clientY,
+      rectLeft: rect.left,
+      rectTop: rect.top,
+    });
+  }
+
+  function reportRects() {
+    rafPending = false;
+    if (!port) return;
+    // Selected element's live bounds - keeps the host's draft pin /
+    // inspector tag / composer glued through scroll and reflow.
+    if (selected) {
+      var sr = selected.getBoundingClientRect();
+      port.postMessage({
+        type: "selRect",
+        left: sr.left,
+        top: sr.top,
+        w: sr.width,
+        h: sr.height,
+        found:
+          (sr.width > 0 || sr.height > 0) &&
+          document.documentElement.contains(selected),
+      });
+    }
+    var rects = [];
+    for (var i = 0; i < pins.length; i++) {
+      var p = pins[i];
+      var el = null;
+      try {
+        el = document.querySelector(p.selector);
+      } catch (e) {
+        el = null;
+      }
+      if (!el) {
+        rects.push({ id: p.id, x: 0, y: 0, found: false });
+        continue;
+      }
+      var r = el.getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) {
+        rects.push({ id: p.id, x: 0, y: 0, found: false });
+        continue;
+      }
+      rects.push({
+        id: p.id,
+        x: r.left + p.pinX * r.width,
+        y: r.top + p.pinY * r.height,
+        found: true,
+      });
+    }
+    var quoteRects = [];
+    if (quotes.length > 0) {
+      var live = null;
+      for (var qi = 0; qi < quotes.length; qi++) {
+        var q = quotes[qi];
+        var qr = quoteRanges[q.id];
+        if (qr === undefined) {
+          if (live === null) {
+            live = (document.body && document.body.textContent) || "";
+          }
+          var loc = locateQuote(live, q);
+          qr = (loc && rangeForOffsets(loc.start, loc.end)) || null;
+          quoteRanges[q.id] = qr;
+        }
+        // Zero paintable rects (display:none subtree) reports as
+        // not-found so the host docks it as detached instead of
+        // rendering nothing clickable.
+        var qlr = qr ? collectLineRects(qr, 80) : [];
+        quoteRects.push(
+          qlr.length > 0
+            ? { id: q.id, found: true, lineRects: qlr }
+            : { id: q.id, found: false, lineRects: [] }
+        );
+      }
+    }
+    port.postMessage({
+      type: "rects",
+      rects: rects,
+      quoteRects: quoteRects,
+      scrollY: window.scrollY || 0,
+    });
+  }
+
+  function scheduleRects() {
+    if (rafPending) return;
+    rafPending = true;
+    var done = false;
+    function run() {
+      if (done) return;
+      done = true;
+      reportRects();
+    }
+    // rAF for paint alignment, with a timeout fallback - rAF is
+    // suspended entirely in hidden tabs and pins must still settle
+    // when the tab becomes visible after background loading.
+    requestAnimationFrame(run);
+    setTimeout(run, 150);
+  }
+
+  function setMode(on) {
+    mode = !!on;
+    document.documentElement.toggleAttribute("data-cwhr-mode", mode);
+    if (!mode) {
+      hoverEl = null;
+      clearSelection();
+    }
+  }
+
+  function setComposing(open) {
+    document.documentElement.toggleAttribute("data-cwhr-composing", !!open);
+  }
+
+  function onPortMessage(ev) {
+    var data = ev.data;
+    if (!data) return;
+    if (data.type === "mode") setMode(data.on);
+    else if (data.type === "composing") setComposing(data.open);
+    else if (data.type === "pins") {
+      pins = Array.isArray(data.pins) ? data.pins : [];
+      scheduleRects();
+    } else if (data.type === "quotes") {
+      quotes = Array.isArray(data.quotes) ? data.quotes : [];
+      quoteRanges = Object.create(null);
+      scheduleRects();
+    } else if (data.type === "clearSelection") {
+      clearSelection();
+    } else if (data.type === "clearTextSel") {
+      var ts = window.getSelection();
+      if (ts) ts.removeAllRanges();
+      hasTextSel = false;
+    } else if (data.type === "restoreScroll") {
+      var ry = Number(data.y);
+      if (isFinite(ry) && ry > 0) {
+        // Apply now and again at load - late images/fonts can grow the
+        // document after the first attempt clamps short.
+        window.scrollTo(0, ry);
+        window.addEventListener("load", function () {
+          window.scrollTo(0, ry);
+        });
+      }
+    }
+  }
+
+  function start() {
+    injectStyle();
+    var channel = new _MessageChannel();
+    port = channel.port1;
+    port.onmessage = onPortMessage;
+    // Sandboxed srcdoc origins can be opaque; "*" is required. The
+    // payload carries only the mount token (multiple sandboxes can be
+    // mounted at once - the token routes the port to the right overlay)
+    // and the channel port itself is pairwise-secure.
+    _topPost(
+      { type: READY_TYPE, token: "e7baeb9c-e32d-42ed-ae6f-a623a7ab4e13" },
+      "*",
+      [channel.port2]
+    );
+    document.addEventListener("mousemove", onMouseMove, true);
+    // documentElement (not document, capture) so this fires only when the
+    // pointer leaves the viewport - capture-phase on document would fire for
+    // every intra-document element-boundary crossing.
+    document.documentElement.addEventListener("mouseleave", onMouseLeave);
+    document.addEventListener("click", onClick, true);
+    // Text-selection capture: commit on mouseup/keyup (Shift+Arrow),
+    // clear on collapse. Not mode-gated; highlight-to-comment is
+    // always on.
+    function onSelCommit() { reportTextSel(true); }
+    document.addEventListener("mouseup", onSelCommit, true);
+    document.addEventListener("keyup", onSelCommit, true);
+    document.addEventListener("selectionchange", function () {
+      var s = window.getSelection();
+      if (hasTextSel && (!s || s.isCollapsed)) reportTextSel(false);
+    });
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape" && port) port.postMessage({ type: "dismiss" });
+    }, true);
+    // Scroll/resize move the hovered element under a stationary pointer -
+    // re-report its rect so the host's inspector box tracks it. Mutations
+    // stay rects-only (animating pages would chatter the cursor stream).
+    var textSelPending = false;
+    function scheduleTextSel() {
+      if (textSelPending) return;
+      textSelPending = true;
+      requestAnimationFrame(function () {
+        textSelPending = false;
+        reportTextSel(false);
+      });
+    }
+    function onLayoutChange() {
+      scheduleRects();
+      if (mode && hoverEl) scheduleCursor();
+      if (hasTextSel) scheduleTextSel();
+    }
+    window.addEventListener("scroll", onLayoutChange, true);
+    window.addEventListener("resize", onLayoutChange);
+    // Full-cache invalidate per childList mutation is acceptable: CSS
+    // animation doesn't fire the observer; JS writers at frame rate
+    // would re-relocate every frame but are rare. characterData isn't
+    // observed, so .data= edits leave highlights stale until the next
+    // childList mutation.
+    var observer = new MutationObserver(function () {
+      quoteRanges = Object.create(null);
+      scheduleRects();
+      if (hasTextSel) scheduleTextSel();
+    });
+    function observe() {
+      if (document.body) observer.observe(document.body, { childList: true, subtree: true });
+    }
+    if (document.body) observe();
+    else document.addEventListener("DOMContentLoaded", observe);
+    // Settle pins after late layout (fonts, images).
+    setInterval(scheduleRects, 2000);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", start);
+  } else {
+    start();
+  }
+})();
+</script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dashboard Penjualan Tenaga Listrik — ULP Mattirotasi</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&amp;family=JetBrains+Mono:wght@400;600&amp;display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0e1a;
+    --bg2: #0f1525;
+    --bg3: #141c30;
+    --card: #141c30;
+    --card2: #1a2440;
+    --border: rgba(99,179,237,0.12);
+    --border2: rgba(99,179,237,0.22);
+    --text: #e8f0fe;
+    --text2: #8b9fc2;
+    --text3: #4a5a7a;
+    --accent: #3b82f6;
+    --accent2: #60a5fa;
+    --green: #10b981;
+    --red: #ef4444;
+    --yellow: #f59e0b;
+    --purple: #8b5cf6;
+    --cyan: #06b6d4;
+    --orange: #f97316;
+    --R: #3b82f6;
+    --B: #10b981;
+    --I: #f59e0b;
+    --P: #8b5cf6;
+    --S: #06b6d4;
+    --shadow: 0 4px 24px rgba(0,0,0,0.4);
+    --radius: 14px;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Plus Jakarta Sans', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  /* HEADER */
+  .header {
+    background: linear-gradient(135deg, #0f1e3d 0%, #0a0e1a 60%, #0f2040 100%);
+    border-bottom: 1px solid var(--border2);
+    padding: 20px 32px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky; top: 0; z-index: 100;
+    backdrop-filter: blur(10px);
+  }
+  .header-left { display: flex; align-items: center; gap: 16px; }
+  .logo-badge {
+    width: 44px; height: 44px;
+    background: linear-gradient(135deg, #1d4ed8, #3b82f6);
+    border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 20px; font-weight: 800; color: white;
+    box-shadow: 0 0 20px rgba(59,130,246,0.4);
+  }
+  .header-title h1 { font-size: 17px; font-weight: 700; color: var(--text); letter-spacing: -0.3px; }
+  .header-title p { font-size: 12px; color: var(--text2); margin-top: 1px; }
+  .header-right { display: flex; align-items: center; gap: 10px; }
+  .live-dot { width: 8px; height: 8px; background: var(--green); border-radius: 50%; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.5;transform:scale(1.3)} }
+  .header-info { font-size: 12px; color: var(--text2); }
+
+  /* FILTERS */
+  .filters-section {
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    padding: 14px 32px;
+    display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-end;
+  }
+  .filter-group { display: flex; flex-direction: column; gap: 6px; }
+  .filter-label { font-size: 11px; font-weight: 600; color: var(--text3); text-transform: uppercase; letter-spacing: 0.8px; }
+  .filter-row { display: flex; gap: 8px; align-items: center; }
+  .filter-sep { font-size: 11px; color: var(--text3); font-weight: 500; padding: 0 2px; }
+  /* Dropdown */
+  .sel {
+    appearance: none; -webkit-appearance: none;
+    background: var(--card) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='11' height='11' viewBox='0 0 24 24' fill='none' stroke='%234a5a7a' stroke-width='2.5'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E") no-repeat right 10px center;
+    border: 1px solid var(--border2);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 12px; font-weight: 500;
+    padding: 6px 28px 6px 11px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: border-color 0.18s, box-shadow 0.18s;
+  }
+  .sel:hover, .sel:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(59,130,246,0.15); outline: none; }
+  .sel option { background: #0f1525; color: var(--text); }
+  .sel-wide { min-width: 160px; }
+
+  /* LAYOUT */
+  .main { padding: 24px 32px; display: flex; flex-direction: column; gap: 24px; max-width: 1800px; margin: 0 auto; }
+
+  /* KPI CARDS */
+  .kpi-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+  .kpi-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+    position: relative; overflow: hidden;
+    transition: transform 0.2s, box-shadow 0.2s;
+  }
+  .kpi-card:hover { transform: translateY(-2px); box-shadow: var(--shadow); }
+  .kpi-card::before {
+    content: '';
+    position: absolute; top: 0; left: 0; right: 0; height: 2px;
+    background: var(--kpi-color, var(--accent));
+  }
+  .kpi-card::after {
+    content: '';
+    position: absolute; top: -20px; right: -20px;
+    width: 90px; height: 90px;
+    background: var(--kpi-color, var(--accent));
+    opacity: 0.05;
+    border-radius: 50%;
+  }
+  .kpi-icon { font-size: 20px; margin-bottom: 10px; }
+  .kpi-label { font-size: 11px; color: var(--text2); text-transform: uppercase; letter-spacing: 0.7px; font-weight: 600; margin-bottom: 6px; }
+  .kpi-value { font-family: 'JetBrains Mono', monospace; font-size: 22px; font-weight: 600; color: var(--text); letter-spacing: -0.5px; margin-bottom: 8px; }
+  .kpi-badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-size: 12px; font-weight: 600;
+    padding: 3px 8px; border-radius: 12px;
+  }
+  .kpi-badge.up { background: rgba(16,185,129,0.15); color: var(--green); }
+  .kpi-badge.down { background: rgba(239,68,68,0.15); color: var(--red); }
+  .kpi-badge.neutral { background: rgba(139,148,180,0.15); color: var(--text2); }
+  .kpi-sub { font-size: 11px; color: var(--text3); margin-top: 4px; }
+
+  /* SECTION HEADER */
+  .section-hdr { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  .section-hdr h2 { font-size: 14px; font-weight: 700; color: var(--text); }
+  .section-hdr .pill {
+    padding: 2px 8px; border-radius: 8px;
+    background: rgba(59,130,246,0.15); color: var(--accent2);
+    font-size: 11px; font-weight: 600;
+  }
+  .divider { flex: 1; height: 1px; background: var(--border); }
+
+  /* CHART CARDS */
+  .chart-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+    position: relative;
+  }
+  .chart-title { font-size: 13px; font-weight: 700; color: var(--text); margin-bottom: 4px; }
+  .chart-sub { font-size: 11px; color: var(--text2); margin-bottom: 16px; }
+  .chart-wrap { position: relative; }
+
+  /* GRIDS */
+  .charts-row { display: grid; gap: 16px; }
+  .grid-2 { grid-template-columns: 1fr 1fr; }
+  .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+  .grid-2-3 { grid-template-columns: 2fr 3fr; }
+  .grid-3-2 { grid-template-columns: 3fr 2fr; }
+
+  /* TABLE */
+  .table-wrap { overflow-x: auto; margin-top: 4px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+
+  /* Header row 1: nama kolom utama */
+  thead tr.th-main th {
+    padding: 8px 10px 4px;
+    text-align: center;
+    font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px;
+    color: var(--text3); background: var(--bg2);
+    border-bottom: none;
+  }
+  thead tr.th-main th:first-child { text-align: left; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  thead tr.th-main th.th-group {
+    border-bottom: 2px solid var(--border2);
+    position: relative;
+  }
+  /* Header row 2: sub kolom 2025 / 2026 / % */
+  thead tr.th-sub th {
+    padding: 3px 6px 7px;
+    text-align: right;
+    font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px;
+    color: var(--text3); background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+  }
+  thead tr.th-sub th.sub-2025 { color: #60a5fa; }
+  thead tr.th-sub th.sub-2026 { color: #34d399; }
+  thead tr.th-sub th.sub-pct  { color: #fbbf24; }
+
+  td {
+    padding: 8px 6px; border-bottom: 1px solid rgba(99,179,237,0.06);
+    color: var(--text2); text-align: right;
+    font-family: 'JetBrains Mono', monospace; font-size: 10.5px;
+  }
+  td:first-child { text-align: left; font-family: inherit; font-size: 12px; padding-left: 10px; }
+  td.pct-pos { color: var(--green); font-weight: 600; }
+  td.pct-neg { color: var(--red);   font-weight: 600; }
+  td.pct-neu { color: var(--text3); }
+  tr:last-child td { border-bottom: none; font-weight: 700; color: var(--text); background: rgba(59,130,246,0.06); }
+  tr:hover td { background: rgba(99,179,237,0.04); }
+  .gol-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-weight: 600; color: var(--text);
+  }
+  .gol-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+
+  /* MINI BAR */
+  .mini-bar-wrap { display: flex; flex-direction: column; gap: 10px; }
+  .mini-bar-item { display: flex; flex-direction: column; gap: 4px; }
+  .mini-bar-row { display: flex; justify-content: space-between; align-items: center; }
+  .mini-bar-label { font-size: 12px; color: var(--text2); font-weight: 500; }
+  .mini-bar-val { font-size: 12px; font-family: 'JetBrains Mono', monospace; color: var(--text); font-weight: 600; }
+  .mini-bar-track { height: 5px; background: var(--bg3); border-radius: 3px; overflow: hidden; }
+  .mini-bar-fill { height: 100%; border-radius: 3px; transition: width 0.6s ease; }
+
+  /* FOOTER */
+  .footer {
+    text-align: center; padding: 20px 32px;
+    border-top: 1px solid var(--border);
+    font-size: 11px; color: var(--text3);
+  }
+
+  /* NO DATA */
+  .no-data { display: flex; align-items: center; justify-content: center; height: 120px; color: var(--text3); font-size: 13px; }
+
+  /* UPLOAD */
+  .btn-upload {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 7px 14px;
+    background: linear-gradient(135deg,#1d4ed8,#3b82f6);
+    border: none; border-radius: 8px;
+    color: #fff; font-family: inherit; font-size: 12px; font-weight: 600;
+    cursor: pointer; transition: opacity .18s, transform .18s;
+    box-shadow: 0 0 14px rgba(59,130,246,.35);
+  }
+  .btn-upload:hover { opacity:.88; transform:translateY(-1px); }
+  .btn-upload svg { flex-shrink:0; }
+  .btn-save {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 7px 14px;
+    background: linear-gradient(135deg,#065f46,#10b981);
+    border: none; border-radius: 8px;
+    color: #fff; font-family: inherit; font-size: 12px; font-weight: 600;
+    cursor: pointer; transition: opacity .18s, transform .18s;
+    box-shadow: 0 0 14px rgba(16,185,129,.3);
+  }
+  .btn-save:hover { opacity:.88; transform:translateY(-1px); }
+  .btn-save svg { flex-shrink:0; }
+  /* Toast notifikasi */
+  .toast {
+    position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%) translateY(20px);
+    background: #0f2e1e; border: 1px solid #10b981;
+    color: #6ee7b7; font-size: 13px; font-weight: 600;
+    padding: 12px 24px; border-radius: 30px;
+    box-shadow: 0 8px 32px rgba(0,0,0,.5);
+    opacity: 0; transition: opacity .3s, transform .3s;
+    z-index: 300; pointer-events: none; white-space: nowrap;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  /* MODAL */
+  .modal-overlay {
+    display:none; position:fixed; inset:0; z-index:200;
+    background:rgba(0,0,0,.65); backdrop-filter:blur(4px);
+    align-items:center; justify-content:center;
+  }
+  .modal-overlay.open { display:flex; }
+  .modal {
+    background:var(--bg2); border:1px solid var(--border2);
+    border-radius:18px; padding:28px 32px; width:520px; max-width:95vw;
+    box-shadow:0 24px 60px rgba(0,0,0,.6);
+    animation: modalIn .22s ease;
+  }
+  @keyframes modalIn { from{opacity:0;transform:translateY(12px)} to{opacity:1;transform:none} }
+  .modal-hdr { display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; }
+  .modal-hdr h3 { font-size:15px; font-weight:700; color:var(--text); }
+  .modal-close { background:none; border:none; color:var(--text3); cursor:pointer; font-size:20px; line-height:1; padding:2px 6px; border-radius:6px; transition:background .15s; }
+  .modal-close:hover { background:rgba(255,255,255,.08); color:var(--text); }
+
+  .drop-zone {
+    border:2px dashed var(--border2); border-radius:12px;
+    padding:36px 20px; text-align:center;
+    cursor:pointer; transition:border-color .18s, background .18s;
+    position:relative;
+  }
+  .drop-zone:hover, .drop-zone.drag-over { border-color:var(--accent); background:rgba(59,130,246,.06); }
+  .drop-zone input[type=file] { position:absolute; inset:0; opacity:0; cursor:pointer; }
+  .drop-icon { font-size:32px; margin-bottom:10px; }
+  .drop-text { font-size:13px; color:var(--text2); line-height:1.6; }
+  .drop-text strong { color:var(--text); }
+  .drop-hint { font-size:11px; color:var(--text3); margin-top:6px; }
+
+  .upload-log {
+    margin-top:16px; max-height:180px; overflow-y:auto;
+    background:var(--bg3); border-radius:8px; padding:10px 12px;
+    font-size:11px; font-family:'JetBrains Mono',monospace;
+    display:none;
+  }
+  .upload-log.show { display:block; }
+  .log-ok  { color:var(--green); }
+  .log-warn{ color:var(--yellow); }
+  .log-err { color:var(--red); }
+
+  .modal-footer { display:flex; justify-content:flex-end; gap:10px; margin-top:20px; }
+  .btn-modal {
+    padding:8px 18px; border-radius:8px; border:none;
+    font-family:inherit; font-size:12px; font-weight:600; cursor:pointer; transition:opacity .15s;
+  }
+  .btn-modal.secondary { background:var(--card2); color:var(--text2); border:1px solid var(--border2); }
+  .btn-modal.secondary:hover { color:var(--text); }
+  .btn-modal.primary { background:var(--accent); color:#fff; }
+  .btn-modal.primary:hover { opacity:.85; }
+  .btn-modal:disabled { opacity:.4; cursor:not-allowed; }
+
+  @media (max-width: 1100px) {
+    .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+    .grid-2, .grid-2-3, .grid-3-2 { grid-template-columns: 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr; }
+    .main { padding: 16px; }
+    .filters-section { padding: 12px 16px; }
+    .header { padding: 14px 16px; }
+  }
+  @media (max-width: 600px) {
+    .kpi-grid { grid-template-columns: 1fr; }
+    .grid-3 { grid-template-columns: 1fr; }
+  }
+</style>
+<style>.__cwhr-sel{outline:1px solid hsl(40 70% 40%) !important;outline-offset:0;}html[data-cwhr-mode]:not(#__cwhr_),html[data-cwhr-mode] :not(#__cwhr_){cursor:url("data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20width%3D'24'%20height%3D'24'%20viewBox%3D'0%200%2024%2024'%3E%3Cpath%20d%3D'M12%20.5h0A11.5%2011.5%200%200%201%2023.5%2012v0A11.5%2011.5%200%200%201%2012%2023.5H2.5a2%202%200%200%201-2-2V12A11.5%2011.5%200%200%201%2012%20.5Z'%20fill%3D'%23fff'%20stroke%3D'rgba(0%2C0%2C0%2C0.22)'%20stroke-width%3D'1'%2F%3E%3C%2Fsvg%3E") 1 23, url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAACjklEQVR4AbRWS2gaURR9TGpiFTUEWpKQkA+EruqizWcRSBRT/G8KKpXiyo0ra1fVNiDFLmypFUo3iht/iO4Uay1FGwtFECl1p6KWLly4CGqrSMTY+wRFQ7WhGYd7Zu697845b+7M8B6BJh+UxcXFG3a7XeTxeHQAC+C12+1+ZLPZhHgMbp8FjLWxAkaj8U48Hg8lEomfIpEoLBaLLTKZTAd4LJFI3kD8HsZ+xGKxoMFgYI9T+JvAtUAg8FylUn3hcDj8ra0t6vLyMmKxWIhCofSAfZyDMRqXy+Wr1eqvPp/vKYjMAEZsRMDpdN6MRCKf+Xz+8cbGBm2kckIAtXShUGgKh8Mnfr9/Ybh0IKDT6a4vLS19EggE+wwGY7jmUj6TyUTQyv35+fmP0MbBexkISKVS+97e3u1LsU0oAo67Go3G1i/pCZjN5t3Nzc0H/zPzPlH/ip8EWvbQYrHs4hwWmN3e3n62traGfZy7MtbX12fYbPYTIKIQOzs7C6urq/cgINVWVlaO4EtjEXq9nken06mksgMZtJthtVp5xNzcHBsEIEWu0Wg0RKVS2USz2WTigFx6hPCkMTfRarXgB6WQzd/j63Q6bdK+nB7j0KnRaCCCIMpTE4D2oEql8m1qAvV6/VSr1U5PIJvN+qFjv6fyBIVC4ZfD4XgJAmekC9RqNZROp1+FQqESCCDSBWCVO1EoFC8wOQZpAnjm0Wj0O/xX94H4HNAzotvtNnreFU6lUgllMplAMpnclcvlp8NURC6Xi8BLGc5N9NvtNqpWq6hcLqN8Pn8OLUkAMe/g4EAOG4WzizcTJpPpA6zFIpfL9Ra2I45/IRgM2lKp1LtisXjs9XpvHR4eHimVythF4n78BwAA//8r8OPFAAAABklEQVQDAPCY8Oae0TJxAAAAAElFTkSuQmCC") 1 23, default !important;}html[data-cwhr-mode][data-cwhr-composing]:not(#__cwhr_),html[data-cwhr-mode][data-cwhr-composing] :not(#__cwhr_){cursor:default !important;}</style></head>
+<body id="artifacts-component-root-html">
+
+<!-- HEADER -->
+<div class="header">
+  <div class="header-left">
+    <div class="logo-badge">⚡</div>
+    <div class="header-title">
+      <h1>Dashboard Penjualan Tenaga Listrik</h1>
+      <p>PT PLN (Persero) · UIW Sulselrabar · UP3 Pare Pare · ULP Mattirotasi</p>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="live-dot"></div>
+    <div class="header-info" id="currentDateInfo">Data: Jan 2025 – Apr 2026</div>
+    <button class="btn-save" id="btnSave">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+      Simpan Dashboard
+    </button>
+    <button class="btn-upload" id="btnOpenUpload">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+      Tambah Data
+    </button>
+  </div>
+</div>
+
+<!-- UPLOAD MODAL -->
+<div class="modal-overlay" id="modalUpload">
+  <div class="modal">
+    <div class="modal-hdr">
+      <h3>⚡ Import Data Penjualan</h3>
+      <button class="modal-close" id="btnCloseModal">✕</button>
+    </div>
+    <p style="font-size:12px;color:var(--text2);margin-bottom:16px;line-height:1.6">
+      Upload satu atau lebih file <strong style="color:var(--text)">CSV Laporan Penjualan PLN</strong> (format PENJUALAN_LAPORAN_1_*.csv). Data baru akan digabungkan otomatis ke dashboard.
+    </p>
+    <div class="drop-zone" id="dropZone">
+      <input type="file" id="fileInput" accept=".csv" multiple="">
+      <div class="drop-icon">📂</div>
+      <div class="drop-text"><strong>Klik atau drag &amp; drop</strong> file CSV di sini</div>
+      <div class="drop-hint">Bisa pilih beberapa file sekaligus · Format: PENJUALAN_LAPORAN_1_[BULAN]_[TAHUN].csv</div>
+    </div>
+    <div class="upload-log" id="uploadLog"></div>
+    <div class="modal-footer">
+      <button class="btn-modal secondary" id="btnCancelUpload">Batal</button>
+      <button class="btn-modal primary" id="btnApplyUpload" disabled="">Terapkan ke Dashboard</button>
+    </div>
+  </div>
+</div>
+
+<!-- FILTERS -->
+<div class="filters-section">
+  <div class="filter-group">
+    <div class="filter-label">Periode Awal</div>
+    <div class="filter-row">
+      <select class="sel" id="selStartMonth">
+        <option value="1">Januari</option><option value="2">Februari</option><option value="3">Maret</option>
+        <option value="4">April</option><option value="5">Mei</option><option value="6">Juni</option>
+        <option value="7">Juli</option><option value="8">Agustus</option><option value="9">September</option>
+        <option value="10">Oktober</option><option value="11">November</option><option value="12">Desember</option>
+      </select>
+      <select class="sel" id="selStartYear">
+        <option value="2025">2025</option><option value="2026">2026</option>
+      </select>
+    </div>
+  </div>
+  <div class="filter-group" style="justify-content:flex-end;padding-bottom:4px">
+    <div class="filter-sep" style="font-size:18px;color:var(--text3)">→</div>
+  </div>
+  <div class="filter-group">
+    <div class="filter-label">Periode Akhir</div>
+    <div class="filter-row">
+      <select class="sel" id="selEndMonth">
+        <option value="1">Januari</option><option value="2">Februari</option><option value="3">Maret</option>
+        <option value="4">April</option><option value="5">Mei</option><option value="6">Juni</option>
+        <option value="7">Juli</option><option value="8">Agustus</option><option value="9">September</option>
+        <option value="10">Oktober</option><option value="11">November</option><option value="12" selected="">Desember</option>
+      </select>
+      <select class="sel" id="selEndYear">
+        <option value="2025">2025</option><option value="2026" selected="">2026</option>
+      </select>
+    </div>
+  </div>
+  <div class="filter-group">
+    <div class="filter-label">Golongan Tarif</div>
+    <select class="sel sel-wide" id="selGol">
+      <option value="ALL">Semua Golongan</option>
+      <option value="R">R — Rumah Tangga</option>
+      <option value="B">B — Bisnis</option>
+      <option value="I">I — Industri</option>
+      <option value="P">P — Publik</option>
+      <option value="S">S — Sosial</option>
+    </select>
+  </div>
+  <div class="filter-group">
+    <div class="filter-label">Batas Daya</div>
+    <select class="sel sel-wide" id="selDaya">
+      <option value="ALL">Semua Daya</option>
+      <option value="450 VA">450 VA</option>
+      <option value="900 VA">900 VA</option>
+      <option value="1.300 VA">1.300 VA</option>
+      <option value="2.200 VA">2.200 VA</option>
+      <option value="3.500-5.500 VA">3.500–5.500 VA</option>
+      <option value="6.600 VA">6.600 VA</option>
+      <option value="&gt;14 kVA">&gt;14 kVA</option>
+      <option value="&gt;200 kVA">&gt;200 kVA</option>
+    </select>
+  </div>
+</div>
+
+<!-- MAIN -->
+<div class="main">
+
+  <!-- KPI -->
+  <div>
+    <div class="section-hdr">
+      <h2>Ringkasan Eksekutif</h2>
+      <span class="pill" id="kpiPeriodLabel">Jan 2026 – Apr 2026</span>
+      <div class="divider"></div>
+    </div>
+    <div class="kpi-grid">
+      <div class="kpi-card" style="--kpi-color:var(--accent)">
+        <div class="kpi-icon">⚡</div>
+        <div class="kpi-label">Total KWh (Akumulatif)</div>
+        <div class="kpi-value" id="kpiKwh">53.23 GWh</div>
+        <div><span class="kpi-badge down" id="kpiKwhBadge">▼ -0.2%</span></div>
+        <div class="kpi-sub" id="kpiKwhSub">Akumulasi 4 bln · vs Jan 2025 – Apr 2025</div>
+      </div>
+      <div class="kpi-card" style="--kpi-color:var(--green)">
+        <div class="kpi-icon">💰</div>
+        <div class="kpi-label">Total Rupiah (Akumulatif)</div>
+        <div class="kpi-value" id="kpiRupiah">Rp 67.23 M</div>
+        <div><span class="kpi-badge up" id="kpiRupiahBadge">▲ +20.6%</span></div>
+        <div class="kpi-sub" id="kpiRupiahSub">Akumulasi 4 bln · vs Jan 2025 – Apr 2025</div>
+      </div>
+      <div class="kpi-card" style="--kpi-color:var(--yellow)">
+        <div class="kpi-icon">👥</div>
+        <div class="kpi-label">Total Pelanggan</div>
+        <div class="kpi-value" id="kpiPelanggan">64.683</div>
+        <div><span class="kpi-badge up" id="kpiPelangganBadge">▲ +3.6%</span></div>
+        <div class="kpi-sub" id="kpiPelangganSub">Rata² 4 bln · vs Jan 2025 – Apr 2025</div>
+      </div>
+      <div class="kpi-card" style="--kpi-color:var(--purple)">
+        <div class="kpi-icon">🔌</div>
+        <div class="kpi-label">Total Daya Terpasang</div>
+        <div class="kpi-value" id="kpiDaya">118.56 MVA</div>
+        <div><span class="kpi-badge up" id="kpiDayaBadge">▲ +5.3%</span></div>
+        <div class="kpi-sub" id="kpiDayaSub">Rata² 4 bln · vs Jan 2025 – Apr 2025</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TREND KWH & RUPIAH -->
+  <div>
+    <div class="section-hdr">
+      <h2>Tren Penjualan</h2>
+      <span class="pill">KWh &amp; Rupiah per Bulan</span>
+      <div class="divider"></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Pemakaian KWh &amp; Pendapatan Rupiah Bulanan</div>
+      <div class="chart-sub">Axis kiri: Total kWh terjual &nbsp;|&nbsp; Axis kanan: Total rupiah penjualan</div>
+      <div class="chart-wrap" style="height:260px"><canvas id="chartKwhRupiah" style="box-sizing: border-box; display: block; height: 260px; width: 540px;" width="810" height="390"></canvas></div>
+    </div>
+  </div>
+
+  <!-- TREND PELANGGAN & DAYA -->
+  <div>
+    <div class="section-hdr">
+      <h2>Tren Pelanggan &amp; Daya</h2>
+      <span class="pill">Pertumbuhan Kumulatif</span>
+      <div class="divider"></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Jumlah Pelanggan &amp; Daya Terpasang</div>
+      <div class="chart-sub">Axis kiri: Jumlah pelanggan aktif &nbsp;|&nbsp; Axis kanan: Total daya terpasang (MVA)</div>
+      <div class="chart-wrap" style="height:240px"><canvas id="chartPelDaya" style="box-sizing: border-box; display: block; height: 240px; width: 540px;" width="810" height="360"></canvas></div>
+    </div>
+  </div>
+
+  <!-- AKUMULATIF KWH VS TARGET -->
+  <div>
+    <div class="section-hdr">
+      <h2>Realisasi KWh Akumulatif vs Target 2026</h2>
+      <span class="pill">Mulai Januari 2025</span>
+      <div class="divider"></div>
+    </div>
+    <div class="chart-card">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px;margin-bottom:4px">
+        <div>
+          <div class="chart-title">KWh Akumulatif Bulanan — Realisasi vs Target</div>
+          <div class="chart-sub">Akumulasi kWh mulai Januari 2025 · Garis target akumulatif mulai Januari 2026</div>
+        </div>
+        <div id="accumKpiRow" style="display:flex;gap:16px;flex-wrap:wrap">
+      <div style="background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:10px 16px;text-align:right;min-width:160px">
+        <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.6px;font-weight:600;margin-bottom:4px">Realisasi s/d April 2026</div>
+        <div style="font-size:17px;font-weight:700;color:var(--accent2);font-family:'JetBrains Mono',monospace">53.231 GWh</div>
+        <div style="font-size:11px;color:var(--text3);margin-top:3px">Target: 53.307 GWh</div>
+      </div>
+      <div style="background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:10px 16px;text-align:right;min-width:160px">
+        <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.6px;font-weight:600;margin-bottom:4px">Pencapaian Target</div>
+        <div style="font-size:17px;font-weight:700;color:var(--red);font-family:'JetBrains Mono',monospace">99.9%</div>
+        <div style="font-size:11px;font-weight:600;color:var(--red);margin-top:3px">
+          ▼ Defisit 0.076 GWh
+        </div>
+      </div>
+      <div style="background:var(--card2);border:1px solid rgba(139,92,246,0.35);border-radius:10px;padding:10px 16px;text-align:right;min-width:160px">
+        <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.6px;font-weight:600;margin-bottom:4px">Proyeksi s/d Desember 2026</div>
+        <div style="font-size:17px;font-weight:700;color:#a78bfa;font-family:'JetBrains Mono',monospace">181.010 GWh</div>
+        <div style="font-size:11px;color:var(--green);margin-top:3px">105.8% dari target</div>
+      </div></div>
+      </div>
+      <div class="chart-wrap" style="height:300px"><canvas id="chartAccum" style="box-sizing: border-box; display: block; height: 300px; width: 540px;" width="810" height="450"></canvas></div>
+    </div>
+  </div>
+
+  <!-- PERBANDINGAN 2025 vs 2026 -->
+  <div>
+    <div class="section-hdr">
+      <h2>Perbandingan 2025 vs 2026</h2>
+      <span class="pill">Year-over-Year</span>
+      <div class="divider"></div>
+    </div>
+    <div class="charts-row grid-2">
+      <div class="chart-card">
+        <div class="chart-title">KWh: 2025 vs 2026</div>
+        <div class="chart-sub">Perbandingan pemakaian kWh per bulan yang sama</div>
+        <div class="chart-wrap" style="height:220px"><canvas id="chartYoyKwh" style="box-sizing: border-box; display: block; height: 220px; width: 548px;" width="822" height="330"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-title">Rupiah: 2025 vs 2026</div>
+        <div class="chart-sub">Perbandingan pendapatan per bulan yang sama</div>
+        <div class="chart-wrap" style="height:220px"><canvas id="chartYoyRupiah" style="box-sizing: border-box; display: block; height: 220px; width: 548px;" width="822" height="330"></canvas></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- KOMPOSISI PER GOLONGAN -->
+  <div>
+    <div class="section-hdr">
+      <h2>Komposisi per Golongan</h2>
+      <span class="pill">Distribusi</span>
+      <div class="divider"></div>
+    </div>
+    <div class="charts-row" style="grid-template-columns:1fr 1fr 1fr 1fr">
+      <div class="chart-card">
+        <div class="chart-title">Pelanggan per Golongan</div>
+        <div class="chart-sub">Jumlah pelanggan</div>
+        <div class="chart-wrap" style="height:200px"><canvas id="chartGolPelanggan" style="box-sizing: border-box; display: block; height: 200px; width: 300px;" width="450" height="300"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-title">Daya per Golongan</div>
+        <div class="chart-sub">Total daya (MVA)</div>
+        <div class="chart-wrap" style="height:200px"><canvas id="chartGolDaya" style="box-sizing: border-box; display: block; height: 200px; width: 300px;" width="450" height="300"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-title">KWh per Golongan</div>
+        <div class="chart-sub">Total kWh</div>
+        <div class="chart-wrap" style="height:200px"><canvas id="chartGolKwh" style="box-sizing: border-box; display: block; height: 200px; width: 300px;" width="450" height="300"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-title">Rupiah per Golongan</div>
+        <div class="chart-sub">Total pendapatan</div>
+        <div class="chart-wrap" style="height:200px"><canvas id="chartGolRupiah" style="box-sizing: border-box; display: block; height: 200px; width: 300px;" width="450" height="300"></canvas></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TABEL + DAYA BREAKDOWN -->
+  <div>
+    <div class="section-hdr">
+      <h2>Detail per Golongan</h2>
+      <span class="pill">Tabel Ringkasan</span>
+      <div class="divider"></div>
+    </div>
+    <div class="charts-row grid-2-3">
+      <div class="chart-card">
+        <div class="chart-title">Distribusi Pelanggan per Daya</div>
+        <div class="chart-sub">Komposisi berdasarkan batas daya</div>
+        <div class="mini-bar-wrap" id="dayaBarChart" style="margin-top:8px"><div class="mini-bar-item">
+      <div class="mini-bar-row">
+        <span class="mini-bar-label">450 VA</span>
+        <span class="mini-bar-val">6.445 <span style="color:var(--text3);font-weight:400;font-size:10px">(10.0%)</span></span>
+      </div>
+      <div class="mini-bar-track"><div class="mini-bar-fill" style="width:24.400355905571438%;background:#3b82f6"></div></div>
+    </div><div class="mini-bar-item">
+      <div class="mini-bar-row">
+        <span class="mini-bar-label">900 VA</span>
+        <span class="mini-bar-val">26.412 <span style="color:var(--text3);font-weight:400;font-size:10px">(40.8%)</span></span>
+      </div>
+      <div class="mini-bar-track"><div class="mini-bar-fill" style="width:100%;background:#10b981"></div></div>
+    </div><div class="mini-bar-item">
+      <div class="mini-bar-row">
+        <span class="mini-bar-label">1.300 VA</span>
+        <span class="mini-bar-val">21.410 <span style="color:var(--text3);font-weight:400;font-size:10px">(33.1%)</span></span>
+      </div>
+      <div class="mini-bar-track"><div class="mini-bar-fill" style="width:81.06317323893%;background:#f59e0b"></div></div>
+    </div><div class="mini-bar-item">
+      <div class="mini-bar-row">
+        <span class="mini-bar-label">2.200 VA</span>
+        <span class="mini-bar-val">6.883 <span style="color:var(--text3);font-weight:400;font-size:10px">(10.6%)</span></span>
+      </div>
+      <div class="mini-bar-track"><div class="mini-bar-fill" style="width:26.058724419287056%;background:#8b5cf6"></div></div>
+    </div><div class="mini-bar-item">
+      <div class="mini-bar-row">
+        <span class="mini-bar-label">3.500-5.500 VA</span>
+        <span class="mini-bar-val">2.270 <span style="color:var(--text3);font-weight:400;font-size:10px">(3.5%)</span></span>
+      </div>
+      <div class="mini-bar-track"><div class="mini-bar-fill" style="width:8.5947409272476%;background:#06b6d4"></div></div>
+    </div><div class="mini-bar-item">
+      <div class="mini-bar-row">
+        <span class="mini-bar-label">6.600 VA</span>
+        <span class="mini-bar-val">1.046 <span style="color:var(--text3);font-weight:400;font-size:10px">(1.6%)</span></span>
+      </div>
+      <div class="mini-bar-track"><div class="mini-bar-fill" style="width:3.9594494822331185%;background:#f97316"></div></div>
+    </div><div class="mini-bar-item">
+      <div class="mini-bar-row">
+        <span class="mini-bar-label">&gt;14 kVA</span>
+        <span class="mini-bar-val">50 <span style="color:var(--text3);font-weight:400;font-size:10px">(0.1%)</span></span>
+      </div>
+      <div class="mini-bar-track"><div class="mini-bar-fill" style="width:0.1883649167976071%;background:#ef4444"></div></div>
+    </div><div class="mini-bar-item">
+      <div class="mini-bar-row">
+        <span class="mini-bar-label">&gt;200 kVA</span>
+        <span class="mini-bar-val">58 <span style="color:var(--text3);font-weight:400;font-size:10px">(0.1%)</span></span>
+      </div>
+      <div class="mini-bar-track"><div class="mini-bar-fill" style="width:0.21960131003540126%;background:#ec4899"></div></div>
+    </div><div class="mini-bar-item">
+      <div class="mini-bar-row">
+        <span class="mini-bar-label">Lainnya</span>
+        <span class="mini-bar-val">111 <span style="color:var(--text3);font-weight:400;font-size:10px">(0.2%)</span></span>
+      </div>
+      <div class="mini-bar-track"><div class="mini-bar-fill" style="width:0.4212180300247998%;background:#6b7280"></div></div>
+    </div></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-title">Ringkasan per Golongan Tarif</div>
+        <div class="chart-sub">Akumulasi periode yang dipilih</div>
+        <div class="table-wrap">
+          <table id="golTable">
+            <thead>
+              <tr class="th-main">
+                <th rowspan="2">Golongan</th>
+                <th colspan="3" class="th-group">Pelanggan</th>
+                <th colspan="3" class="th-group">Daya (MVA)</th>
+                <th colspan="3" class="th-group">KWh</th>
+                <th colspan="3" class="th-group">Rupiah</th>
+                <th colspan="3" class="th-group">Rata² Rp/kWh</th>
+              </tr>
+              <tr class="th-sub">
+                <th class="sub-2025">2025</th><th class="sub-2026">2026</th><th class="sub-pct">%</th>
+                <th class="sub-2025">2025</th><th class="sub-2026">2026</th><th class="sub-pct">%</th>
+                <th class="sub-2025">2025</th><th class="sub-2026">2026</th><th class="sub-pct">%</th>
+                <th class="sub-2025">2025</th><th class="sub-2026">2026</th><th class="sub-pct">%</th>
+                <th class="sub-2025">2025</th><th class="sub-2026">2026</th><th class="sub-pct">%</th>
+              </tr>
+            </thead>
+            <tbody><tr><td><span class="gol-badge"><span class="gol-dot" style="background:#3b82f6"></span>Rumah Tangga (R)</span></td><td>57.764</td><td>59.834</td><td class="pct-pos">+3.6%</td><td>70.53</td><td>73.97</td><td class="pct-pos">+4.9%</td><td>32.835.615</td><td>31.267.344</td><td class="pct-neg">-4.8%</td><td>Rp 30.06 M</td><td>Rp 40.02 M</td><td class="pct-pos">+33.2%</td><td>915</td><td>1.280</td><td class="pct-pos">+39.8%</td></tr><tr><td><span class="gol-badge"><span class="gol-dot" style="background:#10b981"></span>Bisnis (B)</span></td><td>3.326</td><td>3.436</td><td class="pct-pos">+3.3%</td><td>19.93</td><td>20.93</td><td class="pct-pos">+5.0%</td><td>9.463.040</td><td>9.967.429</td><td class="pct-pos">+5.3%</td><td>Rp 12.63 M</td><td>Rp 13.28 M</td><td class="pct-pos">+5.1%</td><td>1.335</td><td>1.332</td><td class="pct-neg">-0.2%</td></tr><tr><td><span class="gol-badge"><span class="gol-dot" style="background:#f59e0b"></span>Industri (I)</span></td><td>92</td><td>93</td><td class="pct-pos">+0.8%</td><td>6.19</td><td>6.04</td><td class="pct-neg">-2.4%</td><td>3.477.890</td><td>3.417.088</td><td class="pct-neg">-1.7%</td><td>Rp 3.84 M</td><td>Rp 3.71 M</td><td class="pct-neg">-3.4%</td><td>1.105</td><td>1.087</td><td class="pct-neg">-1.6%</td></tr><tr><td><span class="gol-badge"><span class="gol-dot" style="background:#8b5cf6"></span>Publik (P)</span></td><td>413</td><td>415</td><td class="pct-pos">+0.5%</td><td>6.31</td><td>6.43</td><td class="pct-pos">+1.8%</td><td>3.130.906</td><td>3.162.149</td><td class="pct-pos">+1.0%</td><td>Rp 5.21 M</td><td>Rp 5.27 M</td><td class="pct-pos">+1.2%</td><td>1.665</td><td>1.668</td><td class="pct-pos">+0.2%</td></tr><tr><td><span class="gol-badge"><span class="gol-dot" style="background:#06b6d4"></span>Sosial (S)</span></td><td>819</td><td>862</td><td class="pct-pos">+5.3%</td><td>9.46</td><td>10.96</td><td class="pct-pos">+15.9%</td><td>4.263.605</td><td>5.124.899</td><td class="pct-pos">+20.2%</td><td>Rp 3.65 M</td><td>Rp 4.35 M</td><td class="pct-pos">+19.1%</td><td>857</td><td>849</td><td class="pct-neg">-0.9%</td></tr><tr><td><span class="gol-badge"><span class="gol-dot" style="background:#e8f0fe"></span>TOTAL</span></td><td>62.443</td><td>64.683</td><td class="pct-pos">+3.6%</td><td>112.59</td><td>118.56</td><td class="pct-pos">+5.3%</td><td>53.337.276</td><td>53.230.983</td><td class="pct-neg">-0.2%</td><td>Rp 55.73 M</td><td>Rp 67.23 M</td><td class="pct-pos">+20.6%</td><td>1.045</td><td>1.263</td><td class="pct-pos">+20.9%</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+
+
+</div>
+
+<div class="footer">
+  Dashboard Penjualan Tenaga Listrik · PT PLN (Persero) UIW Sulselrabar UP3 Pare Pare ULP Mattirotasi · Data Jan 2025 – Apr 2026
+</div>
+
+<script>
+// ============================================================
+// DATA
+// ============================================================
+const RAW = {"2025-08":{"month_name":"Agustus","month_num":8,"year":2025,"label":"Agustus 2025","by_golongan":{"S":{"pelanggan":840,"daya":10730850,"kwh":1215327.322,"rupiah":1033743997},"R":{"pelanggan":58725,"daya":72091050,"kwh":7439126.02,"rupiah":9476535859},"B":{"pelanggan":3386,"daya":20299900,"kwh":2523450.632,"rupiah":3362155491},"I":{"pelanggan":93,"daya":6175700,"kwh":913786.7,"rupiah":1008106849},"P":{"pelanggan":414,"daya":6338300,"kwh":850635.04,"rupiah":1418072400},"TOTAL":{"pelanggan":63494,"daya":115848500,"kwh":13019538.398,"rupiah":16451679341}},"by_daya":{"450 VA":{"pelanggan":6524,"daya":2935800,"kwh":571620.598,"rupiah":242405578},"900 VA":{"pelanggan":26022,"daya":23419800,"kwh":2601363.25,"rupiah":2800475797},"1.300 VA":{"pelanggan":20928,"daya":27206400,"kwh":2364726.31,"rupiah":3367804102},"2.200 VA":{"pelanggan":6605,"daya":16203200,"kwh":1780854.854,"rupiah":2344335268},"3.500-5.500 VA":{"pelanggan":2185,"daya":14229200,"kwh":1390172.319,"rupiah":1775955122},">200 kVA":{"pelanggan":50,"daya":7092700,"kwh":799856.684,"rupiah":823431674},"6.600 VA":{"pelanggan":1018,"daya":18852000,"kwh":2495312.583,"rupiah":3780242145},">14 kVA":{"pelanggan":51,"daya":3636000,"kwh":690379,"rupiah":764252952},"Lainnya":{"pelanggan":111,"daya":2273400,"kwh":325252.8,"rupiah":552776703}}},"2025-04":{"month_name":"April","month_num":4,"year":2025,"label":"April 2025","by_golongan":{"S":{"pelanggan":826,"daya":9650750,"kwh":1061887.928,"rupiah":909164290},"R":{"pelanggan":58038,"daya":70912650,"kwh":6354477.261,"rupiah":8035654918},"B":{"pelanggan":3343,"daya":19995600,"kwh":2414449.828,"rupiah":3227143900},"I":{"pelanggan":92,"daya":6164800,"kwh":875257.67,"rupiah":966079539},"P":{"pelanggan":414,"daya":6318300,"kwh":760661.2,"rupiah":1268843256},"TOTAL":{"pelanggan":62743,"daya":113220500,"kwh":11531241.84,"rupiah":14535140231}},"by_daya":{"450 VA":{"pelanggan":6602,"daya":2970900,"kwh":581300.341,"rupiah":248408313},"900 VA":{"pelanggan":25780,"daya":23202000,"kwh":2271832.373,"rupiah":2469133840},"1.300 VA":{"pelanggan":20579,"daya":26752700,"kwh":1867752.843,"rupiah":2636126440},"2.200 VA":{"pelanggan":6431,"daya":15773100,"kwh":1492763.893,"rupiah":1962557670},"3.500-5.500 VA":{"pelanggan":2149,"daya":13892000,"kwh":1326573.217,"rupiah":1701681648},">200 kVA":{"pelanggan":43,"daya":6193400,"kwh":678851.953,"rupiah":711991452},"6.600 VA":{"pelanggan":997,"daya":18537000,"kwh":2354000.32,"rupiah":3559008610},">14 kVA":{"pelanggan":51,"daya":3626000,"kwh":645659,"rupiah":715115881},"Lainnya":{"pelanggan":111,"daya":2273400,"kwh":312507.9,"rupiah":531116377}}},"2026-04":{"month_name":"April","month_num":4,"year":2026,"label":"April 2026","by_golongan":{"S":{"pelanggan":864,"daya":11029300,"kwh":1389734.672,"rupiah":1179913038},"R":{"pelanggan":59933,"daya":74221150,"kwh":8314267.369,"rupiah":10691690788},"B":{"pelanggan":3446,"daya":21034750,"kwh":2627023.842,"rupiah":3499844177},"I":{"pelanggan":93,"daya":6022900,"kwh":905535.6,"rupiah":983064951},"P":{"pelanggan":417,"daya":6417900,"kwh":801213.281,"rupiah":1336618632},"TOTAL":{"pelanggan":64799,"daya":118990400,"kwh":14149239.64,"rupiah":17914003035}},"by_daya":{"450 VA":{"pelanggan":6412,"daya":2885400,"kwh":570920.844,"rupiah":242760164},"900 VA":{"pelanggan":26413,"daya":23771700,"kwh":2819289.898,"rupiah":3040193862},"1.300 VA":{"pelanggan":21462,"daya":27900600,"kwh":2751700.335,"rupiah":3914762992},"2.200 VA":{"pelanggan":6950,"daya":17001800,"kwh":1988716.303,"rupiah":2648772391},"3.500-5.500 VA":{"pelanggan":2290,"daya":14831100,"kwh":1509803.314,"rupiah":1917115139},">200 kVA":{"pelanggan":60,"daya":7144400,"kwh":930828.876,"rupiah":967956025},"6.600 VA":{"pelanggan":1050,"daya":19800600,"kwh":2613618.47,"rupiah":3966297566},">14 kVA":{"pelanggan":50,"daya":3471500,"kwh":686482,"rupiah":743880359},"Lainnya":{"pelanggan":112,"daya":2183300,"kwh":277879.6,"rupiah":472264537}}},"2025-12":{"month_name":"Desember","month_num":12,"year":2025,"label":"Desember 2025","by_golongan":{"S":{"pelanggan":852,"daya":10838200,"kwh":1267481.722,"rupiah":1075349878},"R":{"pelanggan":59636,"daya":73513200,"kwh":7691949.195,"rupiah":9815514719},"B":{"pelanggan":3417,"daya":20854050,"kwh":2571048.736,"rupiah":3433662558},"I":{"pelanggan":92,"daya":6084400,"kwh":863929.1,"rupiah":938702773},"P":{"pelanggan":414,"daya":6448800,"kwh":855282.69,"rupiah":1417319239},"TOTAL":{"pelanggan":64453,"daya":117958850,"kwh":13314685.631,"rupiah":16810067085}},"by_daya":{"450 VA":{"pelanggan":6485,"daya":2918250,"kwh":571195.57,"rupiah":242256607},"900 VA":{"pelanggan":26344,"daya":23709600,"kwh":2684987.444,"rupiah":2893957398},"1.300 VA":{"pelanggan":21348,"daya":27752400,"kwh":2492598.166,"rupiah":3537282374},"2.200 VA":{"pelanggan":6778,"daya":16580900,"kwh":1837157.112,"rupiah":2440935502},"3.500-5.500 VA":{"pelanggan":2240,"daya":14510300,"kwh":1380074.061,"rupiah":1752769048},">200 kVA":{"pelanggan":56,"daya":7100200,"kwh":836385.188,"rupiah":839652741},"6.600 VA":{"pelanggan":1042,"daya":19576800,"kwh":2546235.89,"rupiah":3857734380},">14 kVA":{"pelanggan":49,"daya":3537000,"kwh":643239,"rupiah":696848342},"Lainnya":{"pelanggan":111,"daya":2273400,"kwh":322813.2,"rupiah":548630693}}},"2025-02":{"month_name":"Februari","month_num":2,"year":2025,"label":"Februari 2025","by_golongan":{"S":{"pelanggan":815,"daya":9329850,"kwh":1021419.507,"rupiah":876366935},"R":{"pelanggan":57712,"daya":70436750,"kwh":8716801.106,"rupiah":6220372569},"B":{"pelanggan":3325,"daya":19938700,"kwh":2225884.062,"rupiah":2975045849},"I":{"pelanggan":92,"daya":6211800,"kwh":796498.4,"rupiah":879448271},"P":{"pelanggan":412,"daya":6303800,"kwh":750492.74,"rupiah":1250076198},"TOTAL":{"pelanggan":62386,"daya":112399300,"kwh":13526601.33,"rupiah":12232451705}},"by_daya":{"450 VA":{"pelanggan":6628,"daya":2982600,"kwh":565398.866,"rupiah":119059270},"900 VA":{"pelanggan":25653,"daya":23087700,"kwh":2969262.03,"rupiah":1616439577},"1.300 VA":{"pelanggan":20389,"daya":26505700,"kwh":3092270.996,"rupiah":2251567475},"2.200 VA":{"pelanggan":6368,"daya":15610600,"kwh":1991417.018,"rupiah":1612997027},"3.500-5.500 VA":{"pelanggan":2146,"daya":13828100,"kwh":1263462.573,"rupiah":1596115439},">200 kVA":{"pelanggan":42,"daya":5953400,"kwh":563849.515,"rupiah":554847955},"6.600 VA":{"pelanggan":996,"daya":18473800,"kwh":2197533.832,"rupiah":3325739139},">14 kVA":{"pelanggan":53,"daya":3684000,"kwh":585129,"rupiah":648754365},"Lainnya":{"pelanggan":111,"daya":2273400,"kwh":298277.5,"rupiah":506931458}}},"2026-02":{"month_name":"Februari","month_num":2,"year":2026,"label":"Februari 2026","by_golongan":{"S":{"pelanggan":861,"daya":10940000,"kwh":1153593.276,"rupiah":980928142},"R":{"pelanggan":59826,"daya":73914800,"kwh":7039917.992,"rupiah":9003735665},"B":{"pelanggan":3436,"daya":20913350,"kwh":2289595.164,"rupiah":3039871890},"I":{"pelanggan":92,"daya":5999900,"kwh":790699.7,"rupiah":858804882},"P":{"pelanggan":414,"daya":6458800,"kwh":743937.7,"rupiah":1243153514},"TOTAL":{"pelanggan":64672,"daya":118449650,"kwh":12105694.721,"rupiah":15301735563}},"by_daya":{"450 VA":{"pelanggan":6463,"daya":2908350,"kwh":511185.85,"rupiah":214223120},"900 VA":{"pelanggan":26430,"daya":23787000,"kwh":2438597.746,"rupiah":2626297892},"1.300 VA":{"pelanggan":21398,"daya":27817400,"kwh":2269382.848,"rupiah":3222945424},"2.200 VA":{"pelanggan":6856,"daya":16784600,"kwh":1679985.286,"rupiah":2232513462},"3.500-5.500 VA":{"pelanggan":2264,"daya":14667700,"kwh":1295787.744,"rupiah":1649520022},">200 kVA":{"pelanggan":57,"daya":7102800,"kwh":780303.889,"rupiah":804044844},"6.600 VA":{"pelanggan":1044,"daya":19659900,"kwh":2244770.258,"rupiah":3403116415},">14 kVA":{"pelanggan":49,"daya":3448500,"kwh":579095,"rupiah":628022441},"Lainnya":{"pelanggan":111,"daya":2273400,"kwh":306586.1,"rupiah":521051943}}},"2025-01":{"month_name":"Januari","month_num":1,"year":2025,"label":"Januari 2025","by_golongan":{"S":{"pelanggan":812,"daya":9245150,"kwh":1053046.238,"rupiah":900017904},"R":{"pelanggan":57432,"daya":70072200,"kwh":9620014.662,"rupiah":7296626723},"B":{"pelanggan":3309,"daya":19829600,"kwh":2418803.995,"rupiah":3226591849},"I":{"pelanggan":92,"daya":6211800,"kwh":929292.8,"rupiah":1030032626},"P":{"pelanggan":412,"daya":6297300,"kwh":821408.24,"rupiah":1367166602},"TOTAL":{"pelanggan":62087,"daya":111834450,"kwh":14854519.26,"rupiah":13844166595}},"by_daya":{"450 VA":{"pelanggan":6645,"daya":2990250,"kwh":636524.497,"rupiah":142229730},"900 VA":{"pelanggan":25546,"daya":22991400,"kwh":3351709.71,"rupiah":1947334996},"1.300 VA":{"pelanggan":20236,"daya":26306800,"kwh":3351124.627,"rupiah":2668547250},"2.200 VA":{"pelanggan":6325,"daya":15494300,"kwh":2165676.713,"rupiah":1839713349},"3.500-5.500 VA":{"pelanggan":2133,"daya":13719400,"kwh":1324605.248,"rupiah":1701137242},">200 kVA":{"pelanggan":42,"daya":5953400,"kwh":599130.328,"rupiah":583425371},"6.600 VA":{"pelanggan":996,"daya":18421500,"kwh":2401535.54,"rupiah":3636531387},">14 kVA":{"pelanggan":53,"daya":3684000,"kwh":708598,"rupiah":788851100},"Lainnya":{"pelanggan":111,"daya":2273400,"kwh":315614.6,"rupiah":536396170}}},"2026-01":{"month_name":"Januari","month_num":1,"year":2026,"label":"Januari 2026","by_golongan":{"S":{"pelanggan":859,"daya":10875900,"kwh":1300944.183,"rupiah":1104498056},"R":{"pelanggan":59742,"daya":73756800,"kwh":7856626.344,"rupiah":10048475465},"B":{"pelanggan":3423,"daya":20854550,"kwh":2568480.038,"rupiah":3428252222},"I":{"pelanggan":92,"daya":6094300,"kwh":873313.5,"rupiah":951699245},"P":{"pelanggan":414,"daya":6448800,"kwh":834444.9,"rupiah":1393006039},"TOTAL":{"pelanggan":64574,"daya":118254050,"kwh":13498078.8,"rupiah":17054097200}},"by_daya":{"450 VA":{"pelanggan":6469,"daya":2911050,"kwh":571926.36,"rupiah":243125713},"900 VA":{"pelanggan":26387,"daya":23748300,"kwh":2710616.46,"rupiah":2916214674},"1.300 VA":{"pelanggan":21370,"daya":27781000,"kwh":2555148.697,"rupiah":3633446771},"2.200 VA":{"pelanggan":6836,"daya":16733600,"kwh":1855252.732,"rupiah":2466655095},"3.500-5.500 VA":{"pelanggan":2249,"daya":14557300,"kwh":1424142.534,"rupiah":1819789706},">200 kVA":{"pelanggan":58,"daya":7103700,"kwh":867480.835,"rupiah":865155082},"6.600 VA":{"pelanggan":1044,"daya":19592200,"kwh":2546192.682,"rupiah":3860270539},">14 kVA":{"pelanggan":50,"daya":3553500,"kwh":645296,"rupiah":702152845},"Lainnya":{"pelanggan":111,"daya":2273400,"kwh":322022.5,"rupiah":547286775}}},"2025-07":{"month_name":"Juli","month_num":7,"year":2025,"label":"Juli 2025","by_golongan":{"S":{"pelanggan":834,"daya":10035850,"kwh":1177866.467,"rupiah":1001004453},"R":{"pelanggan":58503,"daya":71651300,"kwh":7121157.501,"rupiah":9056819622},"B":{"pelanggan":3388,"daya":20255000,"kwh":2471152.674,"rupiah":3291675114},"I":{"pelanggan":93,"daya":6165700,"kwh":955361,"rupiah":1051845958},"P":{"pelanggan":414,"daya":6338300,"kwh":837336.469,"rupiah":1394786595},"TOTAL":{"pelanggan":63268,"daya":114658850,"kwh":12590992.944,"rupiah":15852746110}},"by_daya":{"450 VA":{"pelanggan":6535,"daya":2940750,"kwh":560349.662,"rupiah":242512564},"900 VA":{"pelanggan":25952,"daya":23356800,"kwh":2520553.959,"rupiah":2716418249},"1.300 VA":{"pelanggan":20840,"daya":27092000,"kwh":2263193.543,"rupiah":3206981455},"2.200 VA":{"pelanggan":6555,"daya":16084000,"kwh":1681883.035,"rupiah":2224437097},"3.500-5.500 VA":{"pelanggan":2169,"daya":14029400,"kwh":1319709.932,"rupiah":1683736351},">200 kVA":{"pelanggan":49,"daya":6537700,"kwh":764576.833,"rupiah":742110908},"6.600 VA":{"pelanggan":1006,"daya":18718800,"kwh":2430333.08,"rupiah":3685087843},">14 kVA":{"pelanggan":51,"daya":3626000,"kwh":727337,"rupiah":802418754},"Lainnya":{"pelanggan":111,"daya":2273400,"kwh":323055.9,"rupiah":549042889}}},"2025-06":{"month_name":"Juni","month_num":6,"year":2025,"label":"Juni 2025","by_golongan":{"S":{"pelanggan":830,"daya":10002350,"kwh":1045504.683,"rupiah":893445195},"R":{"pelanggan":58350,"daya":71447200,"kwh":7005768.632,"rupiah":8891799563},"B":{"pelanggan":3364,"daya":20129500,"kwh":2404425.523,"rupiah":3201164326},"I":{"pelanggan":92,"daya":6164800,"kwh":928225.1,"rupiah":1026524573},"P":{"pelanggan":414,"daya":6338300,"kwh":781248.167,"rupiah":1299491175},"TOTAL":{"pelanggan":63086,"daya":114294850,"kwh":12201764.291,"rupiah":15385599565}},"by_daya":{"450 VA":{"pelanggan":6553,"daya":2948850,"kwh":568300.651,"rupiah":240922054},"900 VA":{"pelanggan":25889,"daya":23300100,"kwh":2485933.103,"rupiah":2679034060},"1.300 VA":{"pelanggan":20736,"daya":26956800,"kwh":2192398.93,"rupiah":3105067806},"2.200 VA":{"pelanggan":6529,"daya":16012600,"kwh":1653360.465,"rupiah":2188753984},"3.500-5.500 VA":{"pelanggan":2165,"daya":13988200,"kwh":1300330.426,"rupiah":1666757578},">200 kVA":{"pelanggan":49,"daya":6537700,"kwh":660264.186,"rupiah":668058985},"6.600 VA":{"pelanggan":1003,"daya":18651200,"kwh":2332953.53,"rupiah":3533082210},">14 kVA":{"pelanggan":51,"daya":3626000,"kwh":694649,"rupiah":770994621},"Lainnya":{"pelanggan":111,"daya":2273400,"kwh":313574,"rupiah":532928267}}},"2025-03":{"month_name":"Maret","month_num":3,"year":2025,"label":"Maret 2025","by_golongan":{"S":{"pelanggan":822,"daya":9614350,"kwh":1127250.935,"rupiah":968477421},"R":{"pelanggan":57872,"daya":70697150,"kwh":8144321.807,"rupiah":8506316712},"B":{"pelanggan":3328,"daya":19937900,"kwh":2403901.714,"rupiah":3201508592},"I":{"pelanggan":91,"daya":6152800,"kwh":876841.27,"rupiah":968803139},"P":{"pelanggan":414,"daya":6318300,"kwh":798344.03,"rupiah":1328315175},"TOTAL":{"pelanggan":62557,"daya":112898900,"kwh":13424913.683,"rupiah":15120371181}},"by_daya":{"450 VA":{"pelanggan":6616,"daya":2977200,"kwh":617083.436,"rupiah":250153946},"900 VA":{"pelanggan":25698,"daya":23128200,"kwh":2827335.078,"rupiah":2540359572},"1.300 VA":{"pelanggan":20495,"daya":26643500,"kwh":2674831.487,"rupiah":2861385273},"2.200 VA":{"pelanggan":6401,"daya":15697500,"kwh":1881525.92,"rupiah":2112693652},"3.500-5.500 VA":{"pelanggan":2146,"daya":13851800,"kwh":1429072.257,"rupiah":1810559305},">200 kVA":{"pelanggan":43,"daya":6193400,"kwh":690507.927,"rupiah":738616582},"6.600 VA":{"pelanggan":996,"daya":18514400,"kwh":2346942.978,"rupiah":3555321470},">14 kVA":{"pelanggan":51,"daya":3619500,"kwh":636876,"rupiah":706176929},"Lainnya":{"pelanggan":111,"daya":2273400,"kwh":320738.6,"rupiah":545104452}}},"2026-03":{"month_name":"Maret","month_num":3,"year":2026,"label":"Maret 2026","by_golongan":{"S":{"pelanggan":863,"daya":11009400,"kwh":1280626.503,"rupiah":1087714291},"R":{"pelanggan":59834,"daya":73994450,"kwh":8056532.14,"rupiah":10280935558},"B":{"pelanggan":3440,"daya":20921650,"kwh":2482329.591,"rupiah":3309413395},"I":{"pelanggan":93,"daya":6022900,"kwh":847539.1,"rupiah":921277336},"P":{"pelanggan":415,"daya":6375100,"kwh":782553.014,"rupiah":1301967461},"TOTAL":{"pelanggan":64688,"daya":118546300,"kwh":13477969.594,"rupiah":16960110459}},"by_daya":{"450 VA":{"pelanggan":6434,"daya":2895300,"kwh":591662.09,"rupiah":252806406},"900 VA":{"pelanggan":26416,"daya":23774400,"kwh":2791762.872,"rupiah":2996004779},"1.300 VA":{"pelanggan":21410,"daya":27833000,"kwh":2627299.368,"rupiah":3737259072},"2.200 VA":{"pelanggan":6888,"daya":16853600,"kwh":1883430.893,"rupiah":2509689217},"3.500-5.500 VA":{"pelanggan":2277,"daya":14770000,"kwh":1425755.235,"rupiah":1823235814},">200 kVA":{"pelanggan":57,"daya":7102800,"kwh":790095.246,"rupiah":754592874},"6.600 VA":{"pelanggan":1045,"daya":19663700,"kwh":2422068.89,"rupiah":3667115523},">14 kVA":{"pelanggan":50,"daya":3471500,"kwh":632311,"rupiah":686461286},"Lainnya":{"pelanggan":111,"daya":2182000,"kwh":313584,"rupiah":532945488}}},"2025-05":{"month_name":"Mei","month_num":5,"year":2025,"label":"Mei 2025","by_golongan":{"S":{"pelanggan":829,"daya":9688850,"kwh":1151706.882,"rupiah":985110921},"R":{"pelanggan":58240,"daya":71273050,"kwh":7109765.127,"rupiah":9036695143},"B":{"pelanggan":3355,"daya":20044000,"kwh":2534979.805,"rupiah":3379567304},"I":{"pelanggan":92,"daya":6164800,"kwh":923813.61,"rupiah":1024570357},"P":{"pelanggan":414,"daya":6318300,"kwh":823948.764,"rupiah":1373520446},"TOTAL":{"pelanggan":62962,"daya":113670900,"kwh":12595381.089,"rupiah":15900877423}},"by_daya":{"450 VA":{"pelanggan":6580,"daya":2961000,"kwh":587225.669,"rupiah":250412375},"900 VA":{"pelanggan":25839,"daya":23255100,"kwh":2507188.69,"rupiah":2714512535},"1.300 VA":{"pelanggan":20671,"daya":26872300,"kwh":2204109.451,"rupiah":3123757238},"2.200 VA":{"pelanggan":6506,"daya":15950600,"kwh":1679031.868,"rupiah":2209181618},"3.500-5.500 VA":{"pelanggan":2156,"daya":13957300,"kwh":1410406.81,"rupiah":1799060099},">200 kVA":{"pelanggan":45,"daya":6196900,"kwh":716728.901,"rupiah":733240128},"6.600 VA":{"pelanggan":1003,"daya":18578300,"kwh":2486059.8,"rupiah":3764445051},">14 kVA":{"pelanggan":51,"daya":3626000,"kwh":685620,"rupiah":764101552},"Lainnya":{"pelanggan":111,"daya":2273400,"kwh":319009.9,"rupiah":542166827}}},"2025-11":{"month_name":"November","month_num":11,"year":2025,"label":"November 2025","by_golongan":{"S":{"pelanggan":847,"daya":10813300,"kwh":1307372.399,"rupiah":1112018826},"R":{"pelanggan":59310,"daya":73102400,"kwh":7579996.078,"rupiah":9680701040},"B":{"pelanggan":3425,"daya":20690700,"kwh":2555102.014,"rupiah":3406833313},"I":{"pelanggan":93,"daya":6175700,"kwh":896252.4,"rupiah":974405888},"P":{"pelanggan":414,"daya":6435800,"kwh":840709.524,"rupiah":1400889629},"TOTAL":{"pelanggan":64130,"daya":117437200,"kwh":13232604.368,"rupiah":16680617888}},"by_daya":{"450 VA":{"pelanggan":6490,"daya":2920500,"kwh":559381.614,"rupiah":236728126},"900 VA":{"pelanggan":26197,"daya":23577300,"kwh":2637240.381,"rupiah":2839750267},"1.300 VA":{"pelanggan":21185,"daya":27540500,"kwh":2453868.135,"rupiah":3480926770},"2.200 VA":{"pelanggan":6767,"daya":16582500,"kwh":1804557.989,"rupiah":2397625473},"3.500-5.500 VA":{"pelanggan":2231,"daya":14462600,"kwh":1431201.649,"rupiah":1798824099},">200 kVA":{"pelanggan":55,"daya":7099300,"kwh":819953.953,"rupiah":808966777},"6.600 VA":{"pelanggan":1043,"daya":19345100,"kwh":2538246.547,"rupiah":3850890070},">14 kVA":{"pelanggan":51,"daya":3636000,"kwh":671848,"rupiah":729335083},"Lainnya":{"pelanggan":111,"daya":2273400,"kwh":316306.1,"rupiah":537571223}}},"2025-10":{"month_name":"Oktober","month_num":10,"year":2025,"label":"Oktober 2025","by_golongan":{"S":{"pelanggan":846,"daya":10794800,"kwh":1394071.75,"rupiah":1187808975},"R":{"pelanggan":59099,"daya":72778400,"kwh":8019729.673,"rupiah":10265966422},"B":{"pelanggan":3418,"daya":20653100,"kwh":2689757.916,"rupiah":3588805636},"I":{"pelanggan":93,"daya":6175700,"kwh":919405.1,"rupiah":1001001362},"P":{"pelanggan":414,"daya":6438700,"kwh":886007.676,"rupiah":1475989144},"TOTAL":{"pelanggan":63909,"daya":117056900,"kwh":13976659.554,"rupiah":17654560823}},"by_daya":{"450 VA":{"pelanggan":6498,"daya":2924100,"kwh":586019.726,"rupiah":249470059},"900 VA":{"pelanggan":26108,"daya":23497200,"kwh":2770895.104,"rupiah":2997216616},"1.300 VA":{"pelanggan":21093,"daya":27420900,"kwh":2620759.714,"rupiah":3723489643},"2.200 VA":{"pelanggan":6743,"daya":16527100,"kwh":1917866.638,"rupiah":2546930254},"3.500-5.500 VA":{"pelanggan":2213,"daya":14383600,"kwh":1546489.43,"rupiah":1934675315},">200 kVA":{"pelanggan":53,"daya":7096200,"kwh":847474.439,"rupiah":852569797},"6.600 VA":{"pelanggan":1039,"daya":19298400,"kwh":2671520.703,"rupiah":4047239124},">14 kVA":{"pelanggan":51,"daya":3636000,"kwh":691124,"rupiah":751456211},"Lainnya":{"pelanggan":111,"daya":2273400,"kwh":324509.8,"rupiah":551513804}}},"2025-09":{"month_name":"September","month_num":9,"year":2025,"label":"September 2025","by_golongan":{"S":{"pelanggan":843,"daya":10745600,"kwh":1287855.084,"rupiah":1093890732},"R":{"pelanggan":58966,"daya":72407600,"kwh":7560583.344,"rupiah":9649001607},"B":{"pelanggan":3404,"daya":20446700,"kwh":2557069.054,"rupiah":3410705272},"I":{"pelanggan":93,"daya":6175700,"kwh":878687.1,"rupiah":962649536},"P":{"pelanggan":414,"daya":6339200,"kwh":853992.28,"rupiah":1423997300},"TOTAL":{"pelanggan":63757,"daya":116328400,"kwh":13204775.945,"rupiah":16672583153}},"by_daya":{"450 VA":{"pelanggan":6512,"daya":2930400,"kwh":563134.03,"rupiah":238554918},"900 VA":{"pelanggan":26088,"daya":23479200,"kwh":2637643.143,"rupiah":2844299381},"1.300 VA":{"pelanggan":21044,"daya":27357200,"kwh":2438937.969,"rupiah":3462853325},"2.200 VA":{"pelanggan":6685,"daya":16390400,"kwh":1809555.939,"rupiah":2395489076},"3.500-5.500 VA":{"pelanggan":2193,"daya":14262100,"kwh":1419865.894,"rupiah":1797963065},">200 kVA":{"pelanggan":51,"daya":7093600,"kwh":825131.083,"rupiah":828370341},"6.600 VA":{"pelanggan":1022,"daya":18906100,"kwh":2531110.387,"rupiah":3839688696},">14 kVA":{"pelanggan":51,"daya":3636000,"kwh":662443,"rupiah":726691003},"Lainnya":{"pelanggan":111,"daya":2273400,"kwh":316954.5,"rupiah":538673348}}}};
+
+// ============================================================
+// FILTER STATE
+// ============================================================
+let filters = { startMonth: 1, startYear: 2025, endMonth: 12, endYear: 2026, gol: 'ALL', daya: 'ALL' };
+
+// Colors
+const GOL_COLORS = { R:'#3b82f6', B:'#10b981', I:'#f59e0b', P:'#8b5cf6', S:'#06b6d4', TOTAL:'#e8f0fe' };
+const GOL_LABELS = { R:'Rumah Tangga', B:'Bisnis', I:'Industri', P:'Publik', S:'Sosial', TOTAL:'TOTAL' };
+const DAYA_COLORS = ['#3b82f6','#10b981','#f59e0b','#8b5cf6','#06b6d4','#f97316','#ef4444','#ec4899','#6b7280'];
+const DAYA_ORDER = ['450 VA','900 VA','1.300 VA','2.200 VA','3.500-5.500 VA','6.600 VA','>14 kVA','>200 kVA','Lainnya'];
+
+// Charts registry
+const charts = {};
+
+// ============================================================
+// DATA HELPERS
+// ============================================================
+function getSortedKeys() {
+  return Object.keys(RAW).sort();
+}
+
+function filterData() {
+  return getSortedKeys()
+    .map(k => ({ key: k, ...RAW[k] }))
+    .filter(d => {
+      const yr = d.year;
+      const mn = d.month_num;
+      const startKey = filters.startYear * 100 + filters.startMonth;
+      const endKey   = filters.endYear   * 100 + filters.endMonth;
+      const curKey   = yr * 100 + mn;
+      return curKey >= startKey && curKey <= endKey;
+    });
+}
+
+function getGolVal(d, metric) {
+  if (filters.gol === 'ALL') {
+    // Use TOTAL but if daya filter is active, sum from by_daya
+    if (filters.daya !== 'ALL') {
+      return d.by_daya[filters.daya]?.[metric] || 0;
+    }
+    return d.by_golongan['TOTAL']?.[metric] || 0;
+  } else {
+    const gdata = d.by_golongan[filters.gol];
+    if (!gdata) return 0;
+    // daya filter doesn't apply directly to golongan (no cross data), just use golongan
+    return gdata[metric] || 0;
+  }
+}
+
+function fmtKwh(v) {
+  if (v >= 1e9) return (v/1e9).toFixed(2) + ' GWh';
+  if (v >= 1e6) return (v/1e6).toFixed(2) + ' GWh';
+  if (v >= 1e3) return (v/1e3).toFixed(1) + ' MWh';
+  return v.toFixed(0) + ' kWh';
+}
+function fmtRp(v) {
+  if (v >= 1e12) return 'Rp ' + (v/1e12).toFixed(2) + ' T';
+  if (v >= 1e9) return 'Rp ' + (v/1e9).toFixed(2) + ' M';
+  if (v >= 1e6) return 'Rp ' + (v/1e6).toFixed(1) + ' Jt';
+  return 'Rp ' + v.toFixed(0);
+}
+function fmtNum(v) {
+  return v.toLocaleString('id-ID');
+}
+function fmtDaya(v) {
+  if (v >= 1e9) return (v/1e9).toFixed(2) + ' GVA';
+  if (v >= 1e6) return (v/1e6).toFixed(2) + ' MVA';
+  if (v >= 1e3) return (v/1e3).toFixed(1) + ' kVA';
+  return v.toFixed(0) + ' VA';
+}
+function pctBadge(pct, elId, subEl) {
+  const el = document.getElementById(elId);
+  const sub = document.getElementById(subEl);
+  if (!el) return;
+  if (pct === null) {
+    el.className = 'kpi-badge neutral';
+    el.textContent = '— N/A';
+    if (sub) sub.textContent = 'Tidak ada data tahun lalu';
+    return;
+  }
+  const sign = pct >= 0 ? '+' : '';
+  el.className = pct >= 0 ? 'kpi-badge up' : 'kpi-badge down';
+  el.innerHTML = (pct >= 0 ? '▲' : '▼') + ' ' + sign + pct.toFixed(1) + '%';
+  if (sub) sub.textContent = 'vs bulan sama tahun lalu';
+}
+
+// ============================================================
+// CHART DEFAULTS
+// ============================================================
+Chart.defaults.color = '#8b9fc2';
+Chart.defaults.borderColor = 'rgba(99,179,237,0.1)';
+Chart.defaults.font.family = "'Plus Jakarta Sans', sans-serif";
+Chart.defaults.plugins.legend.display = false;
+
+function makeChart(id, type, data, options = {}) {
+  const canvas = document.getElementById(id);
+  if (!canvas) return null;
+  if (charts[id]) charts[id].destroy();
+  charts[id] = new Chart(canvas, { type, data, options: {
+    responsive: true, maintainAspectRatio: false,
+    plugins: { legend: { display: options.legend || false, labels: { color: '#8b9fc2', font: { size: 11 }, boxWidth: 12, padding: 12 } }, tooltip: { ...tooltipDefaults() } },
+    scales: options.noScales ? {} : defaultScales(options),
+    animation: { duration: 500 },
+    ...options.extra
+  }});
+  return charts[id];
+}
+
+function tooltipDefaults() {
+  return {
+    backgroundColor: 'rgba(14,21,40,0.95)',
+    borderColor: 'rgba(99,179,237,0.3)',
+    borderWidth: 1,
+    titleColor: '#e8f0fe',
+    bodyColor: '#8b9fc2',
+    padding: 10,
+    titleFont: { weight: '700', size: 12 },
+    bodyFont: { size: 11 }
+  };
+}
+
+function defaultScales(opts = {}) {
+  return {
+    x: { grid: { color: 'rgba(99,179,237,0.06)', drawBorder: false }, ticks: { color: '#4a5a7a', font: { size: 10 } } },
+    y: { grid: { color: 'rgba(99,179,237,0.06)', drawBorder: false }, ticks: { color: '#4a5a7a', font: { size: 10 }, callback: opts.yFmt || null } }
+  };
+}
+
+// ============================================================
+// UPDATE FUNCTIONS
+// ============================================================
+function updateAll() {
+  const fd = filterData();
+  updateKPI(fd);
+  updateTrendCharts(fd);
+  updateAccumChart();
+  updateYoyCharts();
+  updateGolCharts(fd);
+  updateTable(fd);
+  updateDayaBar(fd);
+  updatePeriodLabel();
+}
+
+function updatePeriodLabel() {
+  const monthNames = ['','Jan','Feb','Mar','Apr','Mei','Jun','Jul','Agt','Sep','Okt','Nov','Des'];
+  const start = `${monthNames[filters.startMonth]} ${filters.startYear}`;
+  const end   = `${monthNames[filters.endMonth]} ${filters.endYear}`;
+  const golPart = filters.gol === 'ALL' ? '' : ` · Gol. ${filters.gol}`;
+  const dayaPart = filters.daya === 'ALL' ? '' : ` · ${filters.daya}`;
+  document.getElementById('kpiPeriodLabel').textContent = `${start} – ${end}${golPart}${dayaPart}`;
+}
+
+function updateKPI(fd) {
+  if (!fd.length) return;
+  const g = filters.gol === 'ALL' ? 'TOTAL' : filters.gol;
+
+  // Akumulasi periode yang dipilih
+  let totalKwh = 0, totalRp = 0, totalPel = 0, totalDaya = 0;
+  fd.forEach(d => {
+    totalKwh  += getGolVal(d, 'kwh');
+    totalRp   += getGolVal(d, 'rupiah');
+    totalPel  += (d.by_golongan[g]?.pelanggan || 0);
+    totalDaya += (d.by_golongan[g]?.daya || 0);
+  });
+  const avgPel  = fd.length > 0 ? totalPel  / fd.length : 0;
+  const avgDaya = fd.length > 0 ? totalDaya / fd.length : 0;
+
+  // Bangun periode pembanding: geser 1 tahun ke belakang, rentang bulan+bulan sama
+  // Cari semua data RAW yg bulannya cocok tapi tahunnya -1
+  const compFd = getSortedKeys()
+    .map(k => ({ key: k, ...RAW[k] }))
+    .filter(d => {
+      const startKey = (filters.startYear - 1) * 100 + filters.startMonth;
+      const endKey   = (filters.endYear   - 1) * 100 + filters.endMonth;
+      const curKey   = d.year * 100 + d.month_num;
+      return curKey >= startKey && curKey <= endKey;
+    });
+
+  let compKwh = 0, compRp = 0, compPel = 0, compDaya = 0;
+  compFd.forEach(d => {
+    compKwh  += getGolVal(d, 'kwh');
+    compRp   += getGolVal(d, 'rupiah');
+    compPel  += (d.by_golongan[g]?.pelanggan || 0);
+    compDaya += (d.by_golongan[g]?.daya || 0);
+  });
+  const compAvgPel  = compFd.length > 0 ? compPel  / compFd.length : 0;
+  const compAvgDaya = compFd.length > 0 ? compDaya / compFd.length : 0;
+
+  document.getElementById('kpiKwh').textContent = fmtKwh(totalKwh);
+  document.getElementById('kpiRupiah').textContent = fmtRp(totalRp);
+  document.getElementById('kpiPelanggan').textContent = fmtNum(Math.round(avgPel));
+  document.getElementById('kpiDaya').textContent = fmtDaya(avgDaya);
+
+  // Persentase akumulatif vs periode yg sama tahun lalu
+  if (compFd.length > 0) {
+    pctBadge(compKwh  > 0 ? ((totalKwh  - compKwh)  / compKwh  * 100) : null, 'kpiKwhBadge',      'kpiKwhSub');
+    pctBadge(compRp   > 0 ? ((totalRp   - compRp)   / compRp   * 100) : null, 'kpiRupiahBadge',   'kpiRupiahSub');
+    pctBadge(compAvgPel  > 0 ? ((avgPel  - compAvgPel)  / compAvgPel  * 100) : null, 'kpiPelangganBadge', 'kpiPelangganSub');
+    pctBadge(compAvgDaya > 0 ? ((avgDaya - compAvgDaya) / compAvgDaya * 100) : null, 'kpiDayaBadge',      'kpiDayaSub');
+  } else {
+    ['kpiKwhBadge','kpiRupiahBadge','kpiPelangganBadge','kpiDayaBadge'].forEach(id => pctBadge(null, id, id.replace('Badge','Sub')));
+  }
+
+  // Label keterangan
+  const mn = ['','Jan','Feb','Mar','Apr','Mei','Jun','Jul','Agt','Sep','Okt','Nov','Des'];
+  const periodCurr  = `${mn[filters.startMonth]} ${filters.startYear} – ${mn[filters.endMonth]} ${filters.endYear}`;
+  const periodComp  = `${mn[filters.startMonth]} ${filters.startYear-1} – ${mn[filters.endMonth]} ${filters.endYear-1}`;
+  document.getElementById('kpiKwhSub').textContent      = `Akumulasi ${fd.length} bln · vs ${periodComp}`;
+  document.getElementById('kpiRupiahSub').textContent   = `Akumulasi ${fd.length} bln · vs ${periodComp}`;
+  document.getElementById('kpiPelangganSub').textContent = `Rata² ${fd.length} bln · vs ${periodComp}`;
+  document.getElementById('kpiDayaSub').textContent      = `Rata² ${fd.length} bln · vs ${periodComp}`;
+}
+
+function updateTrendCharts(fd) {
+  const labels = fd.map(d => d.month_name.slice(0,3) + ' ' + String(d.year).slice(2));
+  const kwhs  = fd.map(d => getGolVal(d, 'kwh') / 1e6);
+  const rphs  = fd.map(d => getGolVal(d, 'rupiah') / 1e9);
+  const pels  = fd.map(d => {
+    const g = filters.gol === 'ALL' ? 'TOTAL' : filters.gol;
+    return d.by_golongan[g]?.pelanggan || 0;
+  });
+  const dayas = fd.map(d => {
+    const g = filters.gol === 'ALL' ? 'TOTAL' : filters.gol;
+    return (d.by_golongan[g]?.daya || 0) / 1e6;
+  });
+
+  // Chart 1: KWh (left y) + Rupiah (right y)
+  const c1 = document.getElementById('chartKwhRupiah');
+  if (c1) {
+    if (charts['chartKwhRupiah']) charts['chartKwhRupiah'].destroy();
+    charts['chartKwhRupiah'] = new Chart(c1, {
+      data: { labels, datasets: [
+        { type:'line', label:'KWh (GWh)', data:kwhs, yAxisID:'yLeft',
+          borderColor:'#3b82f6', backgroundColor:'#3b82f622', borderWidth:2.5,
+          pointRadius:3, pointHoverRadius:6, fill:true, tension:0.4, pointBackgroundColor:'#3b82f6' },
+        { type:'bar', label:'Rupiah (Miliar Rp)', data:rphs, yAxisID:'yRight',
+          backgroundColor:'#10b98155', borderColor:'#10b981', borderWidth:1.5, borderRadius:4 }
+      ]},
+      options: {
+        responsive:true, maintainAspectRatio:false,
+        interaction:{ mode:'index', intersect:false },
+        plugins:{
+          legend:{ display:true, position:'top', labels:{ color:'#8b9fc2', font:{size:11}, boxWidth:12, padding:16 } },
+          tooltip:{ ...tooltipDefaults(),
+            callbacks:{ label: ctx => ctx.dataset.yAxisID==='yLeft'
+              ? ' KWh: ' + ctx.parsed.y.toFixed(2) + ' GWh'
+              : ' Rupiah: Rp ' + ctx.parsed.y.toFixed(2) + ' M' }
+          }
+        },
+        scales:{
+          x:{ grid:{color:'rgba(99,179,237,0.06)'}, ticks:{color:'#4a5a7a',font:{size:10}} },
+          yLeft:{ type:'linear', position:'left', grid:{color:'rgba(99,179,237,0.06)'},
+            ticks:{color:'#3b82f6',font:{size:10},callback: v => v.toFixed(1)+' GWh'},
+            title:{display:true,text:'KWh (GWh)',color:'#3b82f6',font:{size:10}} },
+          yRight:{ type:'linear', position:'right', grid:{drawOnChartArea:false},
+            ticks:{color:'#10b981',font:{size:10},callback: v => 'Rp '+v.toFixed(0)+' M'},
+            title:{display:true,text:'Rupiah (Miliar)',color:'#10b981',font:{size:10}} }
+        }, animation:{duration:500}
+      }
+    });
+  }
+
+  // Chart 2: Pelanggan (left y) + Daya MVA (right y)
+  const c2 = document.getElementById('chartPelDaya');
+  if (c2) {
+    if (charts['chartPelDaya']) charts['chartPelDaya'].destroy();
+    charts['chartPelDaya'] = new Chart(c2, {
+      data: { labels, datasets: [
+        { type:'line', label:'Pelanggan', data:pels, yAxisID:'yLeft2',
+          borderColor:'#f59e0b', backgroundColor:'#f59e0b22', borderWidth:2.5,
+          pointRadius:3, pointHoverRadius:6, fill:true, tension:0.4, pointBackgroundColor:'#f59e0b' },
+        { type:'line', label:'Daya (MVA)', data:dayas, yAxisID:'yRight2',
+          borderColor:'#8b5cf6', backgroundColor:'#8b5cf622', borderWidth:2.5,
+          pointRadius:3, pointHoverRadius:6, fill:false, tension:0.4, pointBackgroundColor:'#8b5cf6',
+          borderDash:[5,3] }
+      ]},
+      options: {
+        responsive:true, maintainAspectRatio:false,
+        interaction:{ mode:'index', intersect:false },
+        plugins:{
+          legend:{ display:true, position:'top', labels:{ color:'#8b9fc2', font:{size:11}, boxWidth:12, padding:16 } },
+          tooltip:{ ...tooltipDefaults(),
+            callbacks:{ label: ctx => ctx.dataset.yAxisID==='yLeft2'
+              ? ' Pelanggan: ' + ctx.parsed.y.toLocaleString('id-ID')
+              : ' Daya: ' + ctx.parsed.y.toFixed(2) + ' MVA' }
+          }
+        },
+        scales:{
+          x:{ grid:{color:'rgba(99,179,237,0.06)'}, ticks:{color:'#4a5a7a',font:{size:10}} },
+          yLeft2:{ type:'linear', position:'left', grid:{color:'rgba(99,179,237,0.06)'},
+            ticks:{color:'#f59e0b',font:{size:10},callback: v => v.toLocaleString('id-ID')},
+            title:{display:true,text:'Pelanggan',color:'#f59e0b',font:{size:10}} },
+          yRight2:{ type:'linear', position:'right', grid:{drawOnChartArea:false},
+            ticks:{color:'#8b5cf6',font:{size:10},callback: v => v.toFixed(1)+' MVA'},
+            title:{display:true,text:'Daya (MVA)',color:'#8b5cf6',font:{size:10}} }
+        }, animation:{duration:500}
+      }
+    });
+  }
+}
+
+
+// ============================================================
+// AKUMULATIF KWH VS TARGET 2026
+// ============================================================
+// Target akumulatif 2026 (GWh) — kumulatif tahunan, Jan–Des
+const TARGET_2026_ACCUM_GWH = [
+   12.695,  // Jan
+   26.280,  // Feb
+   39.324,  // Mar
+   53.307,  // Apr
+   66.021,  // Mei
+   77.605,  // Jun
+   92.828,  // Jul
+  107.771,  // Ags
+  122.692,  // Sep
+  138.458,  // Okt
+  154.528,  // Nov
+  171.105   // Des
+];
+const MONTH_FULL = ['Januari','Februari','Maret','April','Mei','Juni',
+                    'Juli','Agustus','September','Oktober','November','Desember'];
+
+function updateAccumChart() {
+  const g        = filters.gol === 'ALL' ? 'TOTAL' : filters.gol;
+  const allKeys  = Object.keys(RAW).sort();
+  const keys2025 = allKeys.filter(k => RAW[k].year === 2025);
+  const keys2026 = allKeys.filter(k => RAW[k].year === 2026);
+
+  // ── Helper: ambil kWh bulanan sesuai filter ──────────────
+  function getMonthlyKwh(d) {
+    if (!d) return 0;
+    if (filters.daya !== 'ALL') return d.by_daya[filters.daya]?.kwh || 0;
+    return d.by_golongan[g]?.kwh || 0;
+  }
+
+  // ── Kumpulkan realisasi bulanan 2025 (untuk proyeksi) ────
+  const kwh2025 = {};   // month_num → GWh bulanan
+  keys2025.forEach(k => {
+    kwh2025[RAW[k].month_num] = getMonthlyKwh(RAW[k]) / 1e6;
+  });
+
+  // ── Realisasi bulanan 2026 yang sudah ada ────────────────
+  const kwh2026real = {};   // month_num → GWh bulanan
+  keys2026.forEach(k => {
+    kwh2026real[RAW[k].month_num] = getMonthlyKwh(RAW[k]) / 1e6;
+  });
+  const lastRealMonth = keys2026.length > 0
+    ? RAW[keys2026[keys2026.length - 1]].month_num
+    : 0;
+
+  // ── Bangun array 12 bulan (Jan–Des 2026) ─────────────────
+  // Untuk bulan yg belum ada data: proyeksi dari growth rate 2025
+  const labels      = [];
+  const realData    = [];   // realisasi akumulatif (null jika bulan itu proyeksi)
+  const projData    = [];   // proyeksi akumulatif  (null jika bulan itu realisasi)
+  const targetData  = TARGET_2026_ACCUM_GWH.slice();  // sudah 12 bulan
+
+  // Akumulasi per bulan: mulai dari 0 di Jan 2026
+  let accumReal = 0;   // akumulasi realisasi (hanya bulan yg sudah ada data)
+  let accumProj = 0;   // akumulasi proyeksi  (termasuk bulan proyeksi)
+  let lastMonthKwh = null;  // kWh bulanan bulan terakhir (real atau proj)
+
+  for (let m = 1; m <= 12; m++) {
+    labels.push(MONTH_FULL[m-1].slice(0,3) + ' 26');
+
+    if (kwh2026real[m] != null) {
+      // ── Bulan ini sudah ada realisasi ───────────────────
+      const monthKwh   = kwh2026real[m];
+      accumReal       += monthKwh;
+      accumProj        = accumReal;   // sync proyeksi ke realisasi
+      lastMonthKwh     = monthKwh;
+
+      realData.push(parseFloat(accumReal.toFixed(4)));
+      // Titik join: jika ini bulan pertama setelah proyeksi, buat projData juga
+      // agar garis proyeksi terhubung ke garis realisasi
+      projData.push(m === 1 || lastRealMonth === m ? null : parseFloat(accumReal.toFixed(4)));
+
+    } else {
+      // ── Bulan ini belum ada → proyeksi ──────────────────
+      // Growth rate = (kwh2025[m] - kwh2025[m-1]) / kwh2025[m-1]
+      const kwh25cur  = kwh2025[m]   || null;
+      const kwh25prev = kwh2025[m-1] || null;
+      let growthRate = 0;
+      if (kwh25cur != null && kwh25prev != null && kwh25prev > 0) {
+        growthRate = (kwh25cur - kwh25prev) / kwh25prev;
+      }
+      // Proyeksi kWh bulan ini = kWh bulan sebelumnya × (1 + growthRate)
+      const prevKwh      = lastMonthKwh != null ? lastMonthKwh : (kwh2026real[m-1] || kwh2025[m] || 13);
+      const projMonthKwh = prevKwh * (1 + growthRate);
+      accumProj         += projMonthKwh;
+      lastMonthKwh       = projMonthKwh;
+
+      realData.push(null);   // tidak ada realisasi bulan ini
+      projData.push(parseFloat(accumProj.toFixed(4)));
+    }
+  }
+
+  // ── Titik join: sambungkan garis realisasi ke proyeksi ──
+  // Cari index bulan terakhir realisasi & bulan pertama proyeksi
+  const joinIdx = lastRealMonth > 0 ? lastRealMonth - 1 : -1;
+  if (joinIdx >= 0 && joinIdx < 11) {
+    // Set projData[joinIdx] = realData[joinIdx] supaya garis nyambung
+    projData[joinIdx] = realData[joinIdx];
+  }
+
+  // ── KPI cards ────────────────────────────────────────────
+  // Gunakan data bulan terakhir yang ada realisasinya
+  const lastRealIdx  = lastRealMonth - 1;
+  const lastRealVal  = lastRealMonth > 0 ? realData[lastRealIdx] : null;
+  const lastTargetV  = lastRealMonth > 0 ? TARGET_2026_ACCUM_GWH[lastRealIdx] : null;
+  const lastPct      = (lastRealVal != null && lastTargetV != null && lastTargetV > 0)
+                       ? (lastRealVal / lastTargetV * 100) : null;
+  const diff         = (lastRealVal != null && lastTargetV != null) ? lastRealVal - lastTargetV : null;
+  const isAhead      = diff != null && diff >= 0;
+  const lastLbl      = lastRealMonth > 0 ? MONTH_FULL[lastRealMonth - 1] + ' 2026' : '—';
+
+  // Juga hitung % proyeksi bulan terakhir
+  const lastProjIdx  = projData.reduce((acc,v,i) => v != null ? i : acc, -1);
+  const lastProjVal  = lastProjIdx >= 0 ? projData[lastProjIdx] : null;
+  const lastProjTgt  = lastProjIdx >= 0 ? TARGET_2026_ACCUM_GWH[lastProjIdx] : null;
+  const lastProjPct  = (lastProjVal != null && lastProjTgt != null && lastProjTgt > 0)
+                       ? (lastProjVal / lastProjTgt * 100) : null;
+  const lastProjLbl  = lastProjIdx >= 0 ? MONTH_FULL[lastProjIdx] + ' 2026' : '—';
+
+  let kpiHTML = '';
+  if (lastRealVal != null) {
+    kpiHTML += `
+      <div style="background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:10px 16px;text-align:right;min-width:160px">
+        <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.6px;font-weight:600;margin-bottom:4px">Realisasi s/d ${lastLbl}</div>
+        <div style="font-size:17px;font-weight:700;color:var(--accent2);font-family:'JetBrains Mono',monospace">${lastRealVal.toFixed(3)} GWh</div>
+        <div style="font-size:11px;color:var(--text3);margin-top:3px">Target: ${lastTargetV.toFixed(3)} GWh</div>
+      </div>
+      <div style="background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:10px 16px;text-align:right;min-width:160px">
+        <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.6px;font-weight:600;margin-bottom:4px">Pencapaian Target</div>
+        <div style="font-size:17px;font-weight:700;color:${isAhead?'var(--green)':'var(--red)'};font-family:'JetBrains Mono',monospace">${lastPct != null ? lastPct.toFixed(1)+'%' : '—'}</div>
+        <div style="font-size:11px;font-weight:600;color:${isAhead?'var(--green)':'var(--red)'};margin-top:3px">
+          ${diff != null ? (isAhead?'▲ Surplus +':'▼ Defisit ')+Math.abs(diff).toFixed(3)+' GWh' : '—'}
+        </div>
+      </div>`;
+  }
+  if (lastProjIdx > joinIdx && lastProjVal != null) {
+    kpiHTML += `
+      <div style="background:var(--card2);border:1px solid rgba(139,92,246,0.35);border-radius:10px;padding:10px 16px;text-align:right;min-width:160px">
+        <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.6px;font-weight:600;margin-bottom:4px">Proyeksi s/d ${lastProjLbl}</div>
+        <div style="font-size:17px;font-weight:700;color:#a78bfa;font-family:'JetBrains Mono',monospace">${lastProjVal.toFixed(3)} GWh</div>
+        <div style="font-size:11px;color:${lastProjPct>=100?'var(--green)':'var(--red)'};margin-top:3px">${lastProjPct!=null?lastProjPct.toFixed(1)+'% dari target':''}</div>
+      </div>`;
+  }
+  const kpiRow = document.getElementById('accumKpiRow');
+  if (kpiRow) kpiRow.innerHTML = kpiHTML;
+
+  // ── Build pctArr untuk label di titik ────────────────────
+  // Untuk realisasi: real/target; untuk proyeksi: proj/target
+  const pctArr = labels.map((_, i) => {
+    const r = realData[i];
+    const p = projData[i];
+    const t = targetData[i];
+    if (!t) return null;
+    if (r != null) return (r / t * 100);
+    if (p != null) return (p / t * 100);
+    return null;
+  });
+
+  // ── Build chart ──────────────────────────────────────────
+  const canvas = document.getElementById('chartAccum');
+  if (!canvas) return;
+  if (charts['chartAccum']) charts['chartAccum'].destroy();
+
+  charts['chartAccum'] = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        // 0: Realisasi (garis penuh biru)
+        {
+          label: 'Realisasi Akumulatif (GWh)',
+          data: realData,
+          borderColor: '#3b82f6',
+          backgroundColor: 'rgba(59,130,246,0.08)',
+          borderWidth: 2.5,
+          pointRadius: realData.map(v => v != null ? 5 : 0),
+          pointHoverRadius: 8,
+          pointBackgroundColor: realData.map((r, i) => {
+            const t = targetData[i];
+            if (r == null || t == null) return '#3b82f6';
+            return r >= t ? '#10b981' : '#ef4444';
+          }),
+          pointBorderColor: '#fff',
+          pointBorderWidth: 1.5,
+          fill: true,
+          tension: 0.3,
+          spanGaps: false,
+          order: 1
+        },
+        // 1: Proyeksi (garis putus-putus ungu)
+        {
+          label: 'Proyeksi Akumulatif (GWh)',
+          data: projData,
+          borderColor: '#8b5cf6',
+          backgroundColor: 'rgba(139,92,246,0.04)',
+          borderWidth: 2,
+          borderDash: [7, 5],
+          pointRadius: projData.map(v => v != null ? 4 : 0),
+          pointHoverRadius: 7,
+          pointBackgroundColor: '#8b5cf6',
+          pointBorderColor: '#fff',
+          pointBorderWidth: 1.5,
+          fill: false,
+          tension: 0.3,
+          spanGaps: false,
+          order: 2
+        },
+        // 2: Target (garis putus-putus kuning)
+        {
+          label: 'Target Akumulatif 2026 (GWh)',
+          data: targetData,
+          borderColor: '#f59e0b',
+          backgroundColor: 'rgba(245,158,11,0.0)',
+          borderWidth: 2,
+          borderDash: [8, 4],
+          pointRadius: 3,
+          pointHoverRadius: 6,
+          pointBackgroundColor: '#f59e0b',
+          pointBorderColor: '#fff',
+          pointBorderWidth: 1,
+          fill: false,
+          tension: 0.3,
+          order: 0
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: {
+          display: true,
+          position: 'top',
+          labels: {
+            color: '#8b9fc2', font: { size: 11 },
+            boxWidth: 28, padding: 18,
+            usePointStyle: true, pointStyle: 'line'
+          }
+        },
+        tooltip: {
+          ...tooltipDefaults(),
+          callbacks: {
+            label: ctx => {
+              if (ctx.parsed.y == null) return null;
+              return ' ' + ctx.dataset.label.split('(')[0].trim() + ': ' + ctx.parsed.y.toFixed(3) + ' GWh';
+            },
+            afterBody: items => {
+              const rItem = items.find(i => i.datasetIndex === 0);
+              const pItem = items.find(i => i.datasetIndex === 1);
+              const tItem = items.find(i => i.datasetIndex === 2);
+              const curVal = rItem?.parsed.y ?? pItem?.parsed.y ?? null;
+              const tVal   = tItem?.parsed.y ?? null;
+              if (curVal == null || tVal == null) return [];
+              const pct  = (curVal / tVal * 100).toFixed(1);
+              const diff = curVal - tVal;
+              const tag  = rItem?.parsed.y != null ? 'Realisasi' : 'Proyeksi';
+              return [
+                '──────────────────────────────',
+                ' Pencapaian (' + tag + '): ' + pct + '%',
+                ' Selisih: ' + (diff >= 0 ? '+' : '') + diff.toFixed(3) + ' GWh ' + (diff >= 0 ? '✓' : '✗')
+              ];
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          grid: { color: 'rgba(99,179,237,0.06)' },
+          ticks: { color: '#4a5a7a', font: { size: 10 } }
+        },
+        y: {
+          grid: { color: 'rgba(99,179,237,0.07)' },
+          ticks: {
+            color: '#8b9fc2', font: { size: 10 },
+            callback: v => v.toFixed(0) + ' GWh'
+          },
+          title: { display: true, text: 'Akumulasi KWh (GWh)', color: '#4a5a7a', font: { size: 10 } }
+        }
+      },
+      animation: { duration: 600 }
+    },
+    plugins: [
+      // Plugin A: arsir area antara realisasi/proyeksi vs target
+      {
+        id: 'fillGap',
+        afterDraw(chart) {
+          const { ctx } = chart;
+          const rMeta = chart.getDatasetMeta(0).data;
+          const pMeta = chart.getDatasetMeta(1).data;
+          const tMeta = chart.getDatasetMeta(2).data;
+
+          ctx.save();
+          ctx.globalAlpha = 0.12;
+          for (let i = 0; i < 11; i++) {
+            // Pilih sumber: realisasi atau proyeksi
+            const srcY0 = rMeta[i]?._model?.y ?? rMeta[i]?.y;
+            const srcY1 = rMeta[i+1]?._model?.y ?? rMeta[i+1]?.y;
+            const pvY0  = pMeta[i]?._model?.y ?? pMeta[i]?.y;
+            const pvY1  = pMeta[i+1]?._model?.y ?? pMeta[i+1]?.y;
+            const tY0   = tMeta[i]?.y;
+            const tY1   = tMeta[i+1]?.y;
+
+            const useR0 = realData[i]   != null;
+            const useR1 = realData[i+1] != null;
+            const y0    = useR0 ? srcY0 : pvY0;
+            const y1    = useR1 ? srcY1 : pvY1;
+
+            if (y0==null||y1==null||tY0==null||tY1==null) continue;
+            const x0 = tMeta[i].x, x1 = tMeta[i+1].x;
+            ctx.beginPath();
+            ctx.moveTo(x0,y0); ctx.lineTo(x1,y1);
+            ctx.lineTo(x1,tY1); ctx.lineTo(x0,tY0);
+            ctx.closePath();
+            const avgSrc = ((realData[i]??projData[i]??0) + (realData[i+1]??projData[i+1]??0)) / 2;
+            const avgTgt = (targetData[i] + targetData[i+1]) / 2;
+            ctx.fillStyle = avgSrc >= avgTgt ? '#10b981' : '#ef4444';
+            ctx.fill();
+          }
+          ctx.restore();
+        }
+      },
+      // Plugin B: label % di atas setiap titik (realisasi & proyeksi)
+      {
+        id: 'pctLabel',
+        afterDatasetDraw(chart, args) {
+          if (args.index > 1) return;   // hanya dataset 0 (real) dan 1 (proj)
+          const { ctx } = chart;
+          const meta    = chart.getDatasetMeta(args.index);
+          const isProj  = args.index === 1;
+
+          meta.data.forEach((point, i) => {
+            const val = args.index === 0 ? realData[i] : projData[i];
+            if (val == null) return;
+            const t   = targetData[i];
+            if (!t)   return;
+            const pct   = (val / t * 100).toFixed(1) + '%';
+            const isOk  = val >= t;
+            const x     = point.x;
+            const y     = point.y - 12;
+
+            ctx.save();
+            ctx.font = 'bold 9px Plus Jakarta Sans, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'bottom';
+
+            const w = ctx.measureText(pct).width + 8;
+            const h = 14;
+            // Background pill
+            ctx.fillStyle = isProj
+              ? 'rgba(139,92,246,0.18)'
+              : (isOk ? 'rgba(16,185,129,0.18)' : 'rgba(239,68,68,0.18)');
+            if (ctx.roundRect) {
+              ctx.beginPath(); ctx.roundRect(x - w/2, y - h, w, h, 3); ctx.fill();
+            }
+            // Text
+            ctx.fillStyle = isProj ? '#a78bfa' : (isOk ? '#10b981' : '#ef4444');
+            ctx.fillText(pct, x, y);
+            ctx.restore();
+          });
+        }
+      }
+    ]
+  });
+}
+
+function updateYoyCharts() {
+  const months = [1,2,3,4,5,6,7,8,9,10,11,12];
+  const monthNames = ['Jan','Feb','Mar','Apr','Mei','Jun','Jul','Agt','Sep','Okt','Nov','Des'];
+  
+  const data25kwh = [], data26kwh = [], data25rp = [], data26rp = [], labels = [];
+  months.forEach(m => {
+    const k25 = `2025-${String(m).padStart(2,'0')}`;
+    const k26 = `2026-${String(m).padStart(2,'0')}`;
+    const d25 = RAW[k25], d26 = RAW[k26];
+    // Show all months Jan-Dec for YoY comparison
+    if (true) {
+      labels.push(monthNames[m-1]);
+      const g = filters.gol === 'ALL' ? 'TOTAL' : filters.gol;
+      const getDayaVal = (d, metric) => {
+        if (!d) return null;
+        if (filters.daya !== 'ALL') return d.by_daya[filters.daya]?.[metric] || null;
+        return d.by_golongan[g]?.[metric] || null;
+      };
+      data25kwh.push(d25 ? getDayaVal(d25, 'kwh') / 1e6 : null);
+      data26kwh.push(d26 ? getDayaVal(d26, 'kwh') / 1e6 : null);
+      data25rp.push(d25 ? getDayaVal(d25, 'rupiah') / 1e9 : null);
+      data26rp.push(d26 ? getDayaVal(d26, 'rupiah') / 1e9 : null);
+    }
+  });
+
+  const barStyle25 = { backgroundColor: '#3b82f688', borderColor: '#3b82f6', borderWidth: 1.5, borderRadius: 4 };
+  const barStyle26 = { backgroundColor: '#10b98188', borderColor: '#10b981', borderWidth: 1.5, borderRadius: 4 };
+
+  makeChart('chartYoyKwh', 'bar', {
+    labels,
+    datasets: [
+      { label: '2025', data: data25kwh, ...barStyle25 },
+      { label: '2026', data: data26kwh, ...barStyle26 }
+    ]
+  }, { legend: true, yFmt: v => v ? v.toFixed(1) + ' GWh' : '' });
+
+  makeChart('chartYoyRupiah', 'bar', {
+    labels,
+    datasets: [
+      { label: '2025', data: data25rp, ...barStyle25 },
+      { label: '2026', data: data26rp, ...barStyle26 }
+    ]
+  }, { legend: true, yFmt: v => v ? 'Rp ' + v.toFixed(1) + 'M' : '' });
+}
+
+// Custom doughnut plugin for percent labels (defined once, reused)
+const pctPlugin = {
+  id: 'pctLabels',
+  afterDatasetDraw(chart) {
+    const { ctx, data } = chart;
+    const total = data.datasets[0].data.reduce((a,b) => a + (b||0), 0);
+    if (!total) return;
+    chart.getDatasetMeta(0).data.forEach((arc, i) => {
+      const val = data.datasets[0].data[i];
+      const pct = (val / total * 100);
+      if (pct < 3) return;
+      const mid = arc.startAngle + (arc.endAngle - arc.startAngle) / 2;
+      const r = (arc.innerRadius + arc.outerRadius) / 2;
+      const x = arc.x + Math.cos(mid) * r;
+      const y = arc.y + Math.sin(mid) * r;
+      ctx.save();
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 10px Plus Jakarta Sans, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.shadowColor = 'rgba(0,0,0,0.7)';
+      ctx.shadowBlur = 4;
+      ctx.fillText(pct.toFixed(1) + '%', x, y);
+      ctx.restore();
+    });
+  }
+};
+
+function mkDoughnut(id, labels, colorsArr, colors60Arr, data) {
+  const canvas = document.getElementById(id);
+  if (!canvas) return;
+  if (charts[id]) charts[id].destroy();
+  charts[id] = new Chart(canvas, {
+    type: 'doughnut',
+    data: { labels, datasets: [{ data, backgroundColor: colors60Arr, borderColor: colorsArr, borderWidth: 1.5, hoverOffset: 6 }] },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      cutout: '55%',
+      plugins: {
+        legend: { display: true, position: 'bottom', labels: { color: '#8b9fc2', font: { size: 10 }, boxWidth: 10, padding: 8 } },
+        tooltip: { ...tooltipDefaults(),
+          callbacks: {
+            label: ctx => {
+              const total = ctx.dataset.data.reduce((a,b) => a+(b||0), 0);
+              const pct = total > 0 ? (ctx.parsed / total * 100).toFixed(1) : 0;
+              return ' ' + ctx.label + ': ' + ctx.parsed.toLocaleString('id-ID', {maximumFractionDigits:2}) + ' (' + pct + '%)';
+            }
+          }
+        }
+      },
+      animation: { duration: 500 }
+    },
+    plugins: [pctPlugin]
+  });
+}
+
+function updateGolCharts(fd) {
+  // Mode: jika gol filter = ALL → breakdown per golongan
+  //       jika gol filter = specific → breakdown per kategori daya (lebih informatif)
+  if (filters.gol === 'ALL') {
+    // Breakdown per golongan
+    const gols    = ['R','B','I','P','S'];
+    const labels  = gols.map(g => GOL_LABELS[g] + ' (' + g + ')');
+    const colors  = gols.map(g => GOL_COLORS[g]);
+    const colors60 = gols.map(g => GOL_COLORS[g] + '99');
+
+    const tot = { pel:{}, daya:{}, kwh:{}, rp:{} };
+    gols.forEach(g => { tot.pel[g]=0; tot.daya[g]=0; tot.kwh[g]=0; tot.rp[g]=0; });
+
+    fd.forEach(d => {
+      gols.forEach(g => {
+        const gd = d.by_golongan[g];
+        if (gd) {
+          tot.pel[g]  += gd.pelanggan;
+          tot.daya[g] += gd.daya;
+          tot.kwh[g]  += gd.kwh;
+          tot.rp[g]   += gd.rupiah;
+        }
+      });
+    });
+
+    mkDoughnut('chartGolPelanggan', labels, colors, colors60, gols.map(g => tot.pel[g] / fd.length));
+    mkDoughnut('chartGolDaya',      labels, colors, colors60, gols.map(g => tot.daya[g] / 1e6 / fd.length));
+    mkDoughnut('chartGolKwh',       labels, colors, colors60, gols.map(g => tot.kwh[g] / 1e6));
+    mkDoughnut('chartGolRupiah',    labels, colors, colors60, gols.map(g => tot.rp[g] / 1e9));
+
+  } else {
+    // Filter gol aktif → breakdown per kategori daya dalam golongan tsb
+    // Gunakan by_daya (lintas golongan) sebagai proxy, dengan filter daya jika ada
+    const dayaKeys = filters.daya !== 'ALL' ? [filters.daya] : DAYA_ORDER.filter(dk => dk !== 'Lainnya');
+    const labels   = dayaKeys;
+    const colors   = dayaKeys.map((_, i) => DAYA_COLORS[i % DAYA_COLORS.length]);
+    const colors60 = colors.map(c => c + '99');
+
+    const tot = { pel:{}, daya:{}, kwh:{}, rp:{} };
+    dayaKeys.forEach(dk => { tot.pel[dk]=0; tot.daya[dk]=0; tot.kwh[dk]=0; tot.rp[dk]=0; });
+
+    fd.forEach(d => {
+      dayaKeys.forEach(dk => {
+        const dd = d.by_daya[dk];
+        if (dd) {
+          tot.pel[dk]  += dd.pelanggan;
+          tot.daya[dk] += dd.daya;
+          tot.kwh[dk]  += dd.kwh;
+          tot.rp[dk]   += dd.rupiah;
+        }
+      });
+    });
+
+    // Proporsi golongan terhadap total (untuk skala)
+    const golFrac = fd.map(d => {
+      const totFull = d.by_golongan['TOTAL']?.pelanggan || 1;
+      return (d.by_golongan[filters.gol]?.pelanggan || 0) / totFull;
+    });
+    const avgFrac = golFrac.reduce((a,b)=>a+b,0) / (golFrac.length||1);
+
+    // Tampilkan nilai daya sesuai golongan yang dipilih (dikali fraksi)
+    mkDoughnut('chartGolPelanggan', labels, colors, colors60, dayaKeys.map(dk => (tot.pel[dk] * avgFrac) / fd.length));
+    mkDoughnut('chartGolDaya',      labels, colors, colors60, dayaKeys.map(dk => (tot.daya[dk] * avgFrac) / 1e6 / fd.length));
+    mkDoughnut('chartGolKwh',       labels, colors, colors60, dayaKeys.map(dk => (tot.kwh[dk] * avgFrac) / 1e6));
+    mkDoughnut('chartGolRupiah',    labels, colors, colors60, dayaKeys.map(dk => (tot.rp[dk]  * avgFrac) / 1e9));
+  }
+}
+
+function updateDayaCharts(fd) {
+  const dayaKeys = filters.daya !== 'ALL' ? [filters.daya] : DAYA_ORDER;
+  const totKwh = {}, totRp = {};
+  dayaKeys.forEach(d => { totKwh[d] = 0; totRp[d] = 0; });
+  fd.forEach(month => {
+    dayaKeys.forEach(dk => {
+      const dd = month.by_daya[dk];
+      if (dd) { totKwh[dk] += dd.kwh; totRp[dk] += dd.rupiah; }
+    });
+  });
+
+  const labels = dayaKeys;
+  const colors = dayaKeys.map((_, i) => DAYA_COLORS[i % DAYA_COLORS.length]);
+
+  const barOpts = {
+    noScales: false,
+    extra: { indexAxis: 'y', plugins: { legend: { display: false } } },
+    yFmt: null
+  };
+
+  makeChart('chartDayaKwh', 'bar', {
+    labels, datasets: [{ data: dayaKeys.map(k => totKwh[k] / 1e6), backgroundColor: colors.map(c => c + '99'), borderColor: colors, borderWidth: 1.5, borderRadius: 4 }]
+  }, { ...barOpts, yFmt: v => v.toFixed(1) + ' GWh', extra: { indexAxis: 'y', plugins: { legend: { display: false } } } });
+
+  makeChart('chartDayaRupiah', 'bar', {
+    labels, datasets: [{ data: dayaKeys.map(k => totRp[k] / 1e9), backgroundColor: colors.map(c => c + '99'), borderColor: colors, borderWidth: 1.5, borderRadius: 4 }]
+  }, { ...barOpts, yFmt: v => 'Rp ' + v.toFixed(1) + 'M', extra: { indexAxis: 'y', plugins: { legend: { display: false } } } });
+}
+
+function updateTable(fd) {
+  const gols  = filters.gol === 'ALL' ? ['R','B','I','P','S','TOTAL'] : [filters.gol];
+  const tbody = document.querySelector('#golTable tbody');
+  tbody.innerHTML = '';
+
+  // Pisahkan fd menjadi data 2025 dan 2026 berdasarkan tahun
+  const fd25 = fd.filter(d => d.year === 2025);
+  const fd26 = fd.filter(d => d.year === 2026);
+
+  // Jika filter tahun = hanya satu tahun, kita tetap pisahkan
+  // untuk perbandingan: ambil bulan yang sama dari RAW
+  // Gunakan semua data RAW terfilter bulan (startMonth–endMonth) per tahun
+  function aggByYear(dataArr, g) {
+    const a = { pel: 0, daya: 0, kwh: 0, rp: 0, cnt: 0 };
+    dataArr.forEach(d => {
+      const gd = d.by_golongan[g];
+      if (gd) {
+        a.pel  += gd.pelanggan;
+        a.daya += gd.daya;
+        a.kwh  += gd.kwh;
+        a.rp   += gd.rupiah;
+        a.cnt++;
+      }
+    });
+    return a;
+  }
+
+  // Jika filter tahun bukan "semua", kita perlu data tahun lain sebagai pembanding
+  // Ambil data dari RAW mentah untuk bulan yang sama tapi tahun berbeda
+  function getRawForYear(yr) {
+    return Object.values(RAW)
+      .filter(d => {
+        if (d.year !== yr) return false;
+        const mn = d.month_num;
+        return mn >= filters.startMonth && mn <= filters.endMonth;
+      });
+  }
+
+  // Data 2025 dan 2026: selalu ambil dari bulan yang sama (sesuai filter bulan)
+  const data25 = getRawForYear(2025);
+  const data26 = getRawForYear(2026);
+
+  // Helper format pct
+  function fmtPct(v25, v26) {
+    if (!v25 || !v26 || v25 === 0) return { txt: '—', cls: 'pct-neu' };
+    const pct = ((v26 - v25) / v25) * 100;
+    const sign = pct >= 0 ? '+' : '';
+    const cls  = pct > 0.1 ? 'pct-pos' : pct < -0.1 ? 'pct-neg' : 'pct-neu';
+    return { txt: sign + pct.toFixed(1) + '%', cls };
+  }
+
+  gols.forEach(g => {
+    const a25 = aggByYear(data25, g);
+    const a26 = aggByYear(data26, g);
+
+    // Nilai rata-rata pelanggan dan daya
+    const avgPel25  = a25.cnt > 0 ? a25.pel / a25.cnt : 0;
+    const avgPel26  = a26.cnt > 0 ? a26.pel / a26.cnt : 0;
+    const avgDaya25 = a25.cnt > 0 ? a25.daya / a25.cnt / 1e6 : 0;
+    const avgDaya26 = a26.cnt > 0 ? a26.daya / a26.cnt / 1e6 : 0;
+    const rate25    = a25.kwh > 0 ? a25.rp / a25.kwh : 0;
+    const rate26    = a26.kwh > 0 ? a26.rp / a26.kwh : 0;
+
+    const pPel  = fmtPct(avgPel25,  avgPel26);
+    const pDaya = fmtPct(avgDaya25, avgDaya26);
+    const pKwh  = fmtPct(a25.kwh,   a26.kwh);
+    const pRp   = fmtPct(a25.rp,    a26.rp);
+    const pRate = fmtPct(rate25,     rate26);
+
+    const color = GOL_COLORS[g] || '#e8f0fe';
+    const label = g === 'TOTAL' ? 'TOTAL' : GOL_LABELS[g] + ' (' + g + ')';
+
+    // Helper td: jika tidak ada data tampilkan —
+    const v = (val, fmt) => val > 0 ? fmt(val) : '—';
+
+    const row = document.createElement('tr');
+    row.innerHTML =
+      '<td><span class="gol-badge"><span class="gol-dot" style="background:' + color + '"></span>' + label + '</span></td>' +
+      // Pelanggan
+      '<td>' + v(avgPel25,  v => fmtNum(Math.round(v))) + '</td>' +
+      '<td>' + v(avgPel26,  v => fmtNum(Math.round(v))) + '</td>' +
+      '<td class="' + pPel.cls  + '">' + pPel.txt  + '</td>' +
+      // Daya
+      '<td>' + v(avgDaya25, v => v.toFixed(2)) + '</td>' +
+      '<td>' + v(avgDaya26, v => v.toFixed(2)) + '</td>' +
+      '<td class="' + pDaya.cls + '">' + pDaya.txt + '</td>' +
+      // KWh
+      '<td>' + v(a25.kwh,   v => fmtNum(Math.round(v))) + '</td>' +
+      '<td>' + v(a26.kwh,   v => fmtNum(Math.round(v))) + '</td>' +
+      '<td class="' + pKwh.cls  + '">' + pKwh.txt  + '</td>' +
+      // Rupiah
+      '<td>' + v(a25.rp,    v => fmtRp(v)) + '</td>' +
+      '<td>' + v(a26.rp,    v => fmtRp(v)) + '</td>' +
+      '<td class="' + pRp.cls   + '">' + pRp.txt   + '</td>' +
+      // Rata² Rp/kWh
+      '<td>' + v(rate25,    v => fmtNum(Math.round(v))) + '</td>' +
+      '<td>' + v(rate26,    v => fmtNum(Math.round(v))) + '</td>' +
+      '<td class="' + pRate.cls + '">' + pRate.txt + '</td>';
+
+    tbody.appendChild(row);
+  });
+}
+
+function updateDayaBar(fd) {
+  const dayaKeys = DAYA_ORDER;
+  const tot = {};
+  dayaKeys.forEach(dk => tot[dk] = 0);
+
+  if (filters.gol === 'ALL') {
+    // Gunakan by_daya langsung
+    fd.forEach(month => {
+      dayaKeys.forEach(dk => {
+        const dd = month.by_daya[dk];
+        if (dd) tot[dk] += dd.pelanggan;
+      });
+    });
+  } else {
+    // Proporsi golongan ke total, lalu skala by_daya
+    fd.forEach(month => {
+      const totPel  = month.by_golongan['TOTAL']?.pelanggan || 1;
+      const golPel  = month.by_golongan[filters.gol]?.pelanggan || 0;
+      const frac    = golPel / totPel;
+      dayaKeys.forEach(dk => {
+        const dd = month.by_daya[dk];
+        if (dd) tot[dk] += dd.pelanggan * frac;
+      });
+    });
+  }
+
+  const n = fd.length || 1;
+  const maxVal = Math.max(...dayaKeys.map(k => tot[k] / n), 1);
+  const totalAll = dayaKeys.reduce((s, k) => s + tot[k] / n, 0);
+  const container = document.getElementById('dayaBarChart');
+  if (!container) return;
+  container.innerHTML = '';
+
+  dayaKeys.forEach((dk, i) => {
+    const avg  = tot[dk] / n;
+    const pct  = maxVal > 0 ? (avg / maxVal * 100) : 0;
+    const pctTotal = totalAll > 0 ? (avg / totalAll * 100) : 0;
+    const color = DAYA_COLORS[i % DAYA_COLORS.length];
+    const el = document.createElement('div');
+    el.className = 'mini-bar-item';
+    el.innerHTML = `
+      <div class="mini-bar-row">
+        <span class="mini-bar-label">${dk}</span>
+        <span class="mini-bar-val">${fmtNum(Math.round(avg))} <span style="color:var(--text3);font-weight:400;font-size:10px">(${pctTotal.toFixed(1)}%)</span></span>
+      </div>
+      <div class="mini-bar-track"><div class="mini-bar-fill" style="width:${pct}%;background:${color}"></div></div>
+    `;
+    container.appendChild(el);
+  });
+}
+function getSelVal(id) { return document.getElementById(id).value; }
+
+function readFilters() {
+  filters.startMonth = parseInt(getSelVal('selStartMonth'));
+  filters.startYear  = parseInt(getSelVal('selStartYear'));
+  filters.endMonth   = parseInt(getSelVal('selEndMonth'));
+  filters.endYear    = parseInt(getSelVal('selEndYear'));
+  filters.gol  = getSelVal('selGol');
+  filters.daya = getSelVal('selDaya');
+  // Validate: start <= end
+  const startKey = filters.startYear * 100 + filters.startMonth;
+  const endKey   = filters.endYear   * 100 + filters.endMonth;
+  if (startKey > endKey) {
+    // Swap
+    [filters.startMonth, filters.endMonth] = [filters.endMonth, filters.startMonth];
+    [filters.startYear,  filters.endYear]  = [filters.endYear,  filters.startYear];
+    document.getElementById('selStartMonth').value = filters.startMonth;
+    document.getElementById('selStartYear').value  = filters.startYear;
+    document.getElementById('selEndMonth').value   = filters.endMonth;
+    document.getElementById('selEndYear').value    = filters.endYear;
+  }
+}
+
+['selStartMonth','selStartYear','selEndMonth','selEndYear','selGol','selDaya'].forEach(id => {
+  document.getElementById(id).addEventListener('change', () => { readFilters(); updateAll(); });
+});
+
+// ============================================================
+// SIMPAN DASHBOARD
+// ============================================================
+function saveDashboard() {
+  // Ambil HTML saat ini sebagai string
+  const originalHTML = document.documentElement.outerHTML;
+
+  // Serialisasi RAW terkini ke JSON
+  const rawJson    = JSON.stringify(RAW);
+  const newRawLine = 'const RAW = ' + rawJson + ';';
+
+  // Cari posisi awal blok "const RAW = {" menggunakan indexOf (tanpa regex)
+  const MARKER = 'const RAW = {';
+  const idxStart = originalHTML.indexOf(MARKER);
+  if (idxStart === -1) {
+    alert('Gagal menyimpan: marker data tidak ditemukan.');
+    return;
+  }
+
+  // Cari akhir blok dengan melacak keseimbangan kurung kurawal
+  let depth = 0, idxEnd = -1;
+  for (let i = idxStart + MARKER.length - 1; i < originalHTML.length; i++) {
+    const ch = originalHTML[i];
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) {
+        idxEnd = i + 1;
+        // Lewati titik koma setelah kurung tutup
+        while (idxEnd < originalHTML.length &&
+               (originalHTML[idxEnd] === ';' || originalHTML[idxEnd] === ' ')) {
+          idxEnd++;
+        }
+        break;
+      }
+    }
+  }
+
+  if (idxEnd === -1) {
+    alert('Gagal menyimpan: tidak bisa menemukan akhir blok data.');
+    return;
+  }
+
+  // Gabungkan: sebelum RAW + RAW baru + sesudah RAW
+  const updated = originalHTML.slice(0, idxStart) + newRawLine + originalHTML.slice(idxEnd);
+
+  // Buat blob dan trigger download
+  const blob = new Blob([updated], { type: 'text/html;charset=utf-8' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+
+  // Nama file dengan tanggal: dashboard_penjualan_pln_YYYYMMDD.html
+  const now   = new Date();
+  const pad   = n => String(n).padStart(2, '0');
+  const stamp = now.getFullYear() + pad(now.getMonth() + 1) + pad(now.getDate());
+  a.download  = 'dashboard_penjualan_pln_' + stamp + '.html';
+  a.href      = url;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+
+  // Toast konfirmasi
+  const toast = document.getElementById('toastMsg');
+  toast.classList.add('show');
+  setTimeout(() => toast.classList.remove('show'), 3000);
+}
+document.getElementById('btnSave').addEventListener('click', saveDashboard);
+
+// Set defaults: end month = April 2026 (last data available)
+document.getElementById('selEndMonth').value = '4';
+document.getElementById('selEndYear').value  = '2026';
+
+// ============================================================
+// CSV IMPORT
+// ============================================================
+const MONTH_MAP = {
+  januari:1,februari:2,maret:3,april:4,mei:5,juni:6,
+  juli:7,agustus:8,september:9,oktober:10,november:11,desember:12
+};
+const MONTH_NAME_ID = ['','Januari','Februari','Maret','April','Mei','Juni',
+  'Juli','Agustus','September','Oktober','November','Desember'];
+const DAYA_CATS = [
+  ['450 VA',   /450/],
+  ['900 VA',   /900/],
+  ['1.300 VA', /1[,.]300|1300/],
+  ['2.200 VA', /2[,.]200|2200/],
+  ['3.500-5.500 VA', /3[,.]500|5[,.]500|3500|5500/],
+  ['6.600 VA', /6[,.]600|6600/],
+  ['>14 kVA',  /14\s*kVA|>\s*14/i],
+  ['>200 kVA', /200\s*kVA|>\s*200/i],
+  ['Lainnya',  /.*/]
+];
+
+function detectDayaCat(label) {
+  for (const [cat, re] of DAYA_CATS) {
+    if (re.test(label)) return cat;
+  }
+  return 'Lainnya';
+}
+
+function cleanNum(s) {
+  if (!s) return 0;
+  const n = parseFloat(String(s).replace(/[^0-9.\-]/g,''));
+  return isNaN(n) ? 0 : n;
+}
+
+function parseCSV(text) {
+  const lines = text.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n');
+
+  // Detect bulan/tahun from header
+  let monthNum = 0, year = 0;
+  for (const line of lines) {
+    const m = line.match(/BULAN\s*:\s*(\w+)\s+(\d{4})/i);
+    if (m) {
+      monthNum = MONTH_MAP[m[1].toLowerCase()] || 0;
+      year     = parseInt(m[2]);
+      break;
+    }
+  }
+  // Fallback: try to detect from filename stored in File object (handled outside)
+  if (!monthNum || !year) return null;
+
+  // Parse CSV rows
+  function parseRow(line) {
+    const cols = [];
+    let cur = '', inQ = false;
+    for (const ch of line) {
+      if (ch === '"') { inQ = !inQ; }
+      else if (ch === ',' && !inQ) { cols.push(cur.trim()); cur = ''; }
+      else cur += ch;
+    }
+    cols.push(cur.trim());
+    return cols;
+  }
+
+  const byGol  = {};
+  const byDaya = {};
+
+  for (const line of lines) {
+    const row = parseRow(line);
+    if (row.length < 10) continue;
+    const label = row[0].trim();
+    if (!label) continue;
+
+    const pelanggan = cleanNum(row[4]);
+    const daya      = cleanNum(row[5]);
+    const kwh       = cleanNum(row[6]);
+    const rupiah    = cleanNum(row[15] || row[row.length-1]);
+
+    // Golongan summaries
+    if (label === 'JUMLAH') {
+      byGol['TOTAL'] = { pelanggan, daya, kwh, rupiah };
+    } else if (label.startsWith('JUMLAH ')) {
+      const g = label.replace('JUMLAH ','').trim();
+      byGol[g] = { pelanggan, daya, kwh, rupiah };
+    }
+
+    // Tariff-level rows → map to daya category
+    if (/^[A-Z]\d?\.?\d?[A-Z]?\s*\//.test(label) && pelanggan > 0) {
+      const cat = detectDayaCat(label);
+      if (!byDaya[cat]) byDaya[cat] = { pelanggan:0, daya:0, kwh:0, rupiah:0 };
+      byDaya[cat].pelanggan += pelanggan;
+      byDaya[cat].daya      += daya;
+      byDaya[cat].kwh       += kwh;
+      byDaya[cat].rupiah    += rupiah;
+    }
+  }
+
+  if (!byGol['TOTAL']) return null; // couldn't parse
+
+  return {
+    month_name: MONTH_NAME_ID[monthNum],
+    month_num:  monthNum,
+    year,
+    label: `${MONTH_NAME_ID[monthNum]} ${year}`,
+    by_golongan: byGol,
+    by_daya:     byDaya
+  };
+}
+
+// Pending parsed data before applying
+let pendingData = {};
+
+function logMsg(msg, type='ok') {
+  const log = document.getElementById('uploadLog');
+  log.classList.add('show');
+  const el = document.createElement('div');
+  el.className = 'log-' + type;
+  el.textContent = msg;
+  log.appendChild(el);
+  log.scrollTop = log.scrollHeight;
+}
+
+async function handleFiles(files) {
+  pendingData = {};
+  const log = document.getElementById('uploadLog');
+  log.innerHTML = '';
+  log.classList.remove('show');
+  document.getElementById('btnApplyUpload').disabled = true;
+
+  let okCount = 0;
+  for (const file of files) {
+    if (!file.name.endsWith('.csv')) {
+      logMsg(`✗ ${file.name} — bukan file CSV`, 'err'); continue;
+    }
+    try {
+      const text = await file.text();
+      const parsed = parseCSV(text);
+      if (!parsed) {
+        // Try to extract month/year from filename
+        const fm = file.name.match(/(\w+)[_\s](\d{4})\.csv$/i);
+        if (fm) {
+          const mn = MONTH_MAP[fm[1].toLowerCase()];
+          const yr = parseInt(fm[2]);
+          logMsg(`⚠ ${file.name} — tidak dapat membaca isi (cek format header BULAN)`, 'warn');
+        } else {
+          logMsg(`✗ ${file.name} — format tidak dikenali`, 'err');
+        }
+        continue;
+      }
+      const key = `${parsed.year}-${String(parsed.month_num).padStart(2,'0')}`;
+      const isNew = !RAW[key];
+      pendingData[key] = parsed;
+      logMsg(`✓ ${file.name}  →  ${parsed.label}${isNew ? ' (baru)' : ' (update)'}`, 'ok');
+      okCount++;
+    } catch(e) {
+      logMsg(`✗ ${file.name} — error: ${e.message}`, 'err');
+    }
+  }
+
+  if (okCount > 0) {
+    logMsg(`─────────────────────────────────────`, 'warn');
+    logMsg(`${okCount} file siap diterapkan ke dashboard.`, 'ok');
+    document.getElementById('btnApplyUpload').disabled = false;
+  }
+}
+
+function applyPendingData() {
+  if (!Object.keys(pendingData).length) return;
+  Object.assign(RAW, pendingData);
+
+  // Update year dropdown options
+  const years = [...new Set(Object.values(RAW).map(d => d.year))].sort();
+  ['selStartYear','selEndYear'].forEach(id => {
+    const sel = document.getElementById(id);
+    const cur = sel.value;
+    sel.innerHTML = years.map(y => `<option value="${y}">${y}</option>`).join('');
+    sel.value = years.includes(parseInt(cur)) ? cur : years[years.length-1];
+  });
+
+  // Set end period to latest available
+  const allKeys = Object.keys(RAW).sort();
+  const latestKey = allKeys[allKeys.length-1];
+  const latestData = RAW[latestKey];
+  document.getElementById('selEndMonth').value = latestData.month_num;
+  document.getElementById('selEndYear').value  = latestData.year;
+
+  // Update header info
+  const firstKey = allKeys[0];
+  const firstData = RAW[firstKey];
+  const mn = ['','Jan','Feb','Mar','Apr','Mei','Jun','Jul','Agt','Sep','Okt','Nov','Des'];
+  document.getElementById('currentDateInfo').textContent =
+    `Data: ${mn[firstData.month_num]} ${firstData.year} – ${mn[latestData.month_num]} ${latestData.year}`;
+
+  readFilters();
+  updateAll();
+  closeModal();
+
+  pendingData = {};
+  logMsg('', 'ok');
+}
+
+// Modal open/close
+function openModal() {
+  document.getElementById('modalUpload').classList.add('open');
+  document.getElementById('uploadLog').innerHTML = '';
+  document.getElementById('uploadLog').classList.remove('show');
+  document.getElementById('btnApplyUpload').disabled = true;
+}
+function closeModal() {
+  document.getElementById('modalUpload').classList.remove('open');
+}
+
+document.getElementById('btnOpenUpload').addEventListener('click', openModal);
+document.getElementById('btnCloseModal').addEventListener('click', closeModal);
+document.getElementById('btnCancelUpload').addEventListener('click', closeModal);
+document.getElementById('btnApplyUpload').addEventListener('click', applyPendingData);
+document.getElementById('modalUpload').addEventListener('click', e => {
+  if (e.target === e.currentTarget) closeModal();
+});
+
+// Drag & drop
+const dropZone = document.getElementById('dropZone');
+dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('drag-over');
+  handleFiles([...e.dataTransfer.files]);
+});
+document.getElementById('fileInput').addEventListener('change', e => {
+  handleFiles([...e.target.files]);
+  e.target.value = '';   // reset so same file can be re-selected
+});
+
+// Init
+readFilters();
+updateAll();
+</script>
+<div class="toast" id="toastMsg">✓ Dashboard berhasil disimpan!</div>
+
+
+</body></html>
